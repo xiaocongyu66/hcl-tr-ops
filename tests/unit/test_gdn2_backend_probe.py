@@ -75,12 +75,30 @@ def test_run_probe_returns_report_without_gpu(tmp_path):
     assert report['steps']['tilelang']['stage'] in {'import', 'device', 'compile'}
 
 
+def test_fused_correctness_requires_cuda():
+    if torch.cuda.is_available():
+        pytest.skip('GPU correctness is reported by Kaggle probe')
+    result = probe.compare_fused_gpu(device='cuda')
+    assert not result['ok'] and 'CUDA' in result['error']
+
+
 def test_profile_breakdown_reports_all_stages_on_cpu():
     result = probe.profile_pytorch_breakdown(device='cpu', tokens=32, chunk=8,
                                              heads=2, dk=4, dv=4, reps=1)
     assert result['ok']
     assert set(result['stages']) == {'prep', 'masks', 'trisolve', 'recurrence', 'total'}
     assert all(v['median_ms'] >= 0 for v in result['stages'].values())
+
+
+def test_variant_benchmark_records_all_cpu_variants():
+    result = probe.benchmark_chunk_variants(device='cpu', tokens_list=(32,), chunk=64,
+                                            heads=2, dk=4, dv=4, reps=1)
+    assert result['ok']
+    result_row = result['results']['t32_c64']
+    assert result_row['effective_chunk'] <= 64
+    row = result_row['variants']
+    assert set(row) == {'reference', 'fused_solve', 'fused_blocked64', 'fused_blocked128'}
+    assert all('median_ms' in row[name] for name in row)
 
 
 def test_time_callable_uses_wall_clock_without_cuda():

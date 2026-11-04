@@ -218,7 +218,7 @@ def test_attention_is_causal():
     assert (o1[:, -1] - o2[:, -1]).abs().max() > 1e-3
 
 
-@pytest.mark.parametrize("backend", ["serial", "batched"])
+@pytest.mark.parametrize("backend", ["serial", "batched", "fused"])
 def test_checkpoint_locks_chunk_per_forward_and_matches_gradients(backend):
     import copy
     from torch.utils.checkpoint import checkpoint
@@ -271,6 +271,16 @@ def test_nonfinite_decay_fails_instead_of_reusing_cache():
         layer.dt_bias.fill_(float("nan"))
     with pytest.raises(ValueError, match="NaN/Inf"):
         layer(torch.zeros(1, 4, 16))
+
+
+def test_fused_backend_rejects_unsupported_options():
+    import pytest
+    with pytest.raises(ValueError, match="只支持 fp32"):
+        HybridBackbone(vocab_size=64, d_model=32, n_layer=4, n_head=4,
+                       gdn2_chunk_backend="fused", gdn2_matmul_dtype="fp16")
+    with pytest.raises(NotImplementedError, match="QED/SLA"):
+        __import__('hcl_tr.models.backbone', fromlist=['GDN2Layer']).GDN2Layer(
+            16, 2, chunk_backend="fused", use_qed=True)
 
 
 def test_batched_backbone_matches_serial_with_checkpoint():

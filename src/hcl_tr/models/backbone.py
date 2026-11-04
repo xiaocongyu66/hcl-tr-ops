@@ -180,8 +180,10 @@ class GDN2Layer(nn.Module):
         self._last_dmax: float = 0.0
         self.chunk_override = chunk_override
         self.solve_mode = solve_mode
-        if chunk_backend not in ("serial", "batched"):
+        if chunk_backend not in ("serial", "batched", "fused"):
             raise ValueError(f"不支持的 GDN2 chunk backend: {chunk_backend}")
+        if chunk_backend == "fused" and (use_qed or use_sla):
+            raise NotImplementedError("fused GDN2 backend 暂不支持 QED/SLA")
         self.chunk_backend = chunk_backend
         self.use_chunkwise = use_chunkwise
         # SLA 叠在 GDN-2 上（计划书 §9「在 +GDN/QED 上加 SLA」）：
@@ -191,6 +193,8 @@ class GDN2Layer(nn.Module):
         # 矩阵乘精度：T4 上 fp16 张量核是 fp32 的 8 倍；状态始终 fp32
         self.matmul_dtype = {"fp32": torch.float32, "fp16": torch.float16,
                              "bf16": torch.bfloat16}[matmul_dtype]
+        if self.chunk_backend == "fused" and self.matmul_dtype != torch.float32:
+            raise ValueError("fused GDN2 backend 当前只支持 fp32 matmul")
         if use_sla:
             self.sla_gq = nn.Linear(d_model, n_head, bias=True)
             self.sla_gk = nn.Linear(d_model, n_head, bias=True)
@@ -266,15 +270,23 @@ class GDN2Layer(nn.Module):
                 if record is not None:
                     record.update(chunk_eff=chunk_eff, dmax=dmax)
             self._chunk_eff, self._last_dmax = chunk_eff, dmax
-            chunk_forward = (gdn2_chunkwise_batched_forward if self.chunk_backend == "batched"
-                             else gdn2_chunkwise_forward)
-            o = chunk_forward(
-                q, k, v, g, b, w, chunk=self.chunk,
-                divide_by_sqrt_t=self.divide_by_sqrt_t, l2norm_qk=True,
-                gq=gq, gk=gk, matmul_dtype=self.matmul_dtype,
-                sub_chunk=self.sub_chunk, chunk_override=self.chunk_override,
-                chunk_eff_in=self._chunk_eff, solve_mode=self.solve_mode,
-            )
+            if self.chunk_backend == "fused":
+                from .gdn2_chunk_opt import chunkwise_fused
+                o = chunkwise_fused(
+                    q, k, v, g, b, w, chunk=self.chunk,
+                    divide_by_sqrt_t=self.divide_by_sqrt_t, l2norm_qk=True,
+                    matmul_dtype=self.matmul_dtype, chunk_eff=self._chunk_eff,
+                )
+            else:
+                chunk_forward = (gdn2_chunkwise_batched_forward if self.chunk_backend == "batched"
+                                 else gdn2_chunkwise_forward)
+                o = chunk_forward(
+                    q, k, v, g, b, w, chunk=self.chunk,
+                    divide_by_sqrt_t=self.divide_by_sqrt_t, l2norm_qk=True,
+                    gq=gq, gk=gk, matmul_dtype=self.matmul_dtype,
+                    sub_chunk=self.sub_chunk, chunk_override=self.chunk_override,
+                    chunk_eff_in=self._chunk_eff, solve_mode=self.solve_mode,
+                )
         else:
             o = gdn2_recurrent_forward(
                 q, k, v, g, b, w,

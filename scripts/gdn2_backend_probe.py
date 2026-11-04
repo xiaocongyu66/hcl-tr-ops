@@ -130,13 +130,21 @@ def compare_backend(backend, tensors: dict, *, chunk: int, tolerance=None) -> di
 
 
 def make_tensors(*, device="cpu", batch=2, tokens=16, heads=3, dk=8, dv=8, seed=0,
-                 requires_grad=False):
+                 requires_grad=False, realistic_decay=False):
     gen = torch.Generator(device="cpu").manual_seed(seed)
     shape = (batch, tokens, heads, dk)
     q = torch.randn(shape, generator=gen)
     k = torch.randn(shape, generator=gen)
     v = torch.randn((batch, tokens, heads, dv), generator=gen)
-    g = -torch.rand(shape, generator=gen)
+    if realistic_decay:
+        a_scale = torch.empty((heads,), dtype=torch.float32).uniform_(1.0, 16.0, generator=gen)
+        dt = torch.empty((heads, dk), dtype=torch.float32).uniform_(1e-3, 1e-1, generator=gen)
+        dt_bias = dt + torch.log(-torch.expm1(-dt))
+        pre = torch.randn(shape, generator=gen) * 0.04
+        g = -a_scale.view(1, 1, heads, 1) * torch.nn.functional.softplus(
+            pre + dt_bias.view(1, 1, heads, dk))
+    else:
+        g = -torch.rand(shape, generator=gen)
     b = torch.rand(shape, generator=gen)
     w = torch.rand((batch, tokens, heads, dv), generator=gen)
     out = dict(q=q, k=k, v=v, g=g, b=b, w=w)
@@ -309,6 +317,184 @@ def profile_pytorch_breakdown(*, tokens=8192, chunk=512, heads=10, dk=64, dv=64,
                                   for k, v in stages.items()})
 
 
+def compare_fused_gpu(*, tokens_list=(64, 2048), chunk=512, heads=10, dk=64, dv=64,
+                      device="cuda", check_gradients=True) -> dict:
+    """直接对照 fused 输出与现有 batched 输出，防止性能快来自漏算。"""
+    if device == "cuda" and not torch.cuda.is_available():
+        return dict(ok=False, error="需要 CUDA")
+    from hcl_tr.models.gdn2_ref import gdn2_chunkwise_batched_forward
+    from hcl_tr.models.gdn2_chunk_opt import chunkwise_fused
+    rows = {}
+    for tokens in tokens_list:
+        t = make_tensors(device=device, batch=1, tokens=tokens, heads=heads, dk=dk, dv=dv,
+                         seed=7, realistic_decay=True)
+        args = (t["q"], t["k"], t["v"], t["g"], t["b"], t["w"])
+        dmax = float((-t["g"].detach()).amax())
+        chunk_eff = max(1, min(chunk, int(40.0 / dmax))) if dmax > 0 else chunk
+        ref_inputs = [x.detach().requires_grad_(check_gradients and tokens <= 64) for x in args]
+        ref = gdn2_chunkwise_batched_forward(*ref_inputs, chunk=chunk, divide_by_sqrt_t=True,
+                                              l2norm_qk=True, chunk_eff_in=chunk_eff)
+        row = {}
+        for name, kwargs in (("fused_solve", dict(solve="reference")),
+                             ("fused_blocked64", dict(solve="blocked", block=64))):
+            try:
+                fused_inputs = [x.detach().requires_grad_(check_gradients and tokens <= 64)
+                                for x in args]
+                got = chunkwise_fused(*fused_inputs, chunk=chunk, chunk_eff=chunk_eff, **kwargs)
+            except ValueError as exc:
+                row[name] = dict(skipped=str(exc))
+                continue
+            diff = (got.float() - ref.float()).abs()
+            scale = ref.float().abs().clamp_min(1e-12)
+            row[name] = dict(max_abs=float(diff.max()), mean_abs=float(diff.mean()),
+                             max_rel=float((diff / scale).max()),
+                             finite=bool(torch.isfinite(got).all()))
+            if check_gradients and tokens <= 64:
+                weight = torch.randn_like(ref)
+                (ref * weight).sum().backward()
+                (got * weight).sum().backward()
+                grad_errors = [float((a.grad - b.grad).abs().max())
+                               for a, b in zip(fused_inputs, ref_inputs)]
+                row[name]["grad_max_abs"] = max(grad_errors)
+                row[name]["grad_each_max_abs"] = grad_errors
+                row[name]["grad_finite"] = all(bool(torch.isfinite(a.grad).all())
+                                                for a in fused_inputs)
+        rows[f"t{tokens}"] = row
+    ok = all(v["finite"] and v["max_abs"] <= 5e-4 for r in rows.values() for v in r.values())
+    return dict(ok=ok, rows=rows, requested_chunk=chunk,
+                effective_chunk=chunk_eff, dmax=dmax, realistic_decay=True,
+                tolerance_abs=5e-4)
+
+
+def benchmark_stage_compare(*, tokens=8192, chunk=512, heads=10, dk=64, dv=64,
+                            reps=5, device="cuda") -> dict:
+    """把"参考实现 vs 融合实现"的差异定位到具体算子。
+
+    共享同一份预处理结果，只比较：掩码构造（两次 GEMM vs 一次合并 GEMM）
+    与三角求解（整块 vs 分块）。
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        return dict(ok=False, error="需要 CUDA")
+    if device == "cuda":
+        _warm_clocks()
+    t = make_tensors(device=device, batch=1, tokens=tokens, heads=heads, dk=dk, dv=dv, seed=1)
+    q, k, v, g, b, w = (x.float() for x in (t["q"], t["k"], t["v"], t["g"], t["b"], t["w"]))
+    n = (tokens + chunk - 1) // chunk
+    pad = n * chunk - tokens
+    mask_lt = torch.ones(chunk, chunk, device=device, dtype=torch.bool).tril(-1)
+    mask_le = torch.ones(chunk, chunk, device=device, dtype=torch.bool).tril()
+
+    def window(x):
+        part = x if not pad else torch.cat((x, x.new_zeros(1, pad, heads, x.shape[-1])), dim=1)
+        return part.reshape(1, n, chunk, heads, x.shape[-1]).permute(0, 1, 3, 2, 4)
+
+    Q, K, V, Gm, Bm, W = (window(x) for x in (_l2norm(q), _l2norm(k), v, g, b, w))
+    cum = Gm.cumsum(dim=-2)
+    exp_cum = cum.exp()
+    bk_e = (Bm * K) * exp_cum
+    q_e = Q * exp_cum
+    k_ei = K * torch.exp(-cum.clamp(min=-40.0))
+    rhs = torch.cat((W * V, bk_e), dim=-1).float()
+
+    def masks_reference():
+        a = (bk_e @ k_ei.transpose(-1, -2)).masked_fill(~mask_lt, 0.0).float()
+        p = (q_e @ k_ei.transpose(-1, -2)).masked_fill(~mask_le, 0.0)
+        return a, p
+
+    def masks_fused():
+        both = torch.cat((bk_e, q_e), dim=-2) @ k_ei.transpose(-1, -2)
+        a = both[..., :chunk, :].masked_fill(~mask_lt, 0.0).float()
+        p = both[..., chunk:, :].masked_fill(~mask_le, 0.0)
+        return a, p
+
+    a_ref, _ = masks_reference()
+    lin = torch.eye(chunk, device=device, dtype=torch.float32) + a_ref
+
+    from hcl_tr.models.gdn2_chunk_opt import _blocked_solve
+
+    stages = {
+        "masks_two_gemm": masks_reference,
+        "masks_one_gemm": masks_fused,
+        "solve_whole": lambda: torch.linalg.solve_triangular(lin, rhs, upper=False),
+        "solve_blocked64": lambda: _blocked_solve(a_ref, rhs, 64),
+    }
+    out = {}
+    for name, fn in stages.items():
+        timing = time_callable(fn, warmup=2, reps=reps)
+        out[name] = dict(median_ms=timing["median_ms"], min_ms=timing["min_ms"])
+    return dict(ok=True, tokens=tokens, chunk=chunk, reps=reps, results=out)
+
+
+def benchmark_chunk_variants(*, tokens_list=(2048, 8192), chunk=512, heads=10, dk=64,
+                             dv=64, reps=5, device="cuda") -> dict:
+    """同场对比：现有批量实现 vs 融合 A/P vs 融合 + 分块前代。
+
+    所有变体用同一批输入、同一轮内计时，避免时钟爬升造成的跨轮偏差。
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        return dict(ok=False, error="需要 CUDA")
+    from hcl_tr.models.gdn2_ref import gdn2_chunkwise_batched_forward
+    from hcl_tr.models.gdn2_chunk_opt import chunkwise_fused
+
+    variants = {
+        "reference": lambda a, c, ce: gdn2_chunkwise_batched_forward(
+            *a, chunk=c, chunk_eff_in=ce, divide_by_sqrt_t=True, l2norm_qk=True),
+        "fused_solve": lambda a, c, ce: chunkwise_fused(
+            *a, chunk=c, chunk_eff=ce, solve="reference"),
+        "fused_blocked64": lambda a, c, ce: chunkwise_fused(
+            *a, chunk=c, chunk_eff=ce, solve="blocked", block=64),
+        "fused_blocked128": lambda a, c, ce: chunkwise_fused(
+            *a, chunk=c, chunk_eff=ce, solve="blocked", block=128),
+    }
+
+    if device == "cuda":
+        _warm_clocks()
+
+    results = {}
+    for tokens in tokens_list:
+        t = make_tensors(device=device, batch=1, tokens=tokens, heads=heads, dk=dk, dv=dv,
+                         seed=1, realistic_decay=True)
+        args = (t["q"], t["k"], t["v"], t["g"], t["b"], t["w"])
+        dmax = float((-t["g"].detach()).amax())
+        chunk_eff = max(1, min(chunk, int(40.0 / dmax))) if dmax > 0 else chunk
+        row = {}
+        # 正反两轮：若某变体只在"第一个跑"时慢，说明是时钟爬升而不是实现差异。
+        for pass_name, order in (("forward", list(variants)),
+                                 ("reverse", list(variants)[::-1])):
+            for name in order:
+                fn = variants[name]
+                try:
+                    timing = time_callable(lambda fn=fn: fn(args, chunk, chunk_eff), warmup=2, reps=reps)
+                except ValueError as exc:
+                    row.setdefault(name, {}).setdefault("skipped", str(exc))
+                    continue
+                entry = row.setdefault(name, {})
+                entry.setdefault("passes_ms", {})[pass_name] = timing["median_ms"]
+                entry["median_ms"] = min(entry["passes_ms"].values())
+                entry["max_ms"] = max(entry.get("max_ms", 0.0), timing["max_ms"])
+        baseline = row.get("reference", {}).get("median_ms")
+        for name, value in row.items():
+            if baseline and "median_ms" in value:
+                value["speedup_vs_reference"] = baseline / value["median_ms"]
+                passes = value["passes_ms"]
+                if len(passes) == 2:
+                    value["order_effect"] = max(passes.values()) / min(passes.values())
+        results[f"t{tokens}_c{chunk}"] = dict(
+            requested_chunk=chunk, effective_chunk=chunk_eff, dmax=dmax, variants=row)
+    return dict(ok=True, requested_chunk=chunk, heads=heads, dk=dk, dv=dv,
+                realistic_decay=True, reps=reps,
+                order_control="forward+reverse, median_ms=两轮较小值", results=results)
+
+
+def _warm_clocks(seconds: float = 1.5) -> None:
+    """先把 GPU 时钟拉满，避免第一个测量项被低频拖慢。"""
+    a = torch.randn(2048, 2048, device="cuda")
+    deadline = time.perf_counter() + seconds
+    while time.perf_counter() < deadline:
+        a = a @ a
+    torch.cuda.synchronize()
+
+
 def probe_matmul_baseline(*, device="cuda", shape=(2048, 64, 64), reps=10) -> dict:
     """给出 torch 在代表性 chunk 规模上的基线，作为 TileLang 后续对比的分母。
 
@@ -360,6 +546,12 @@ def run_probe(*, output: Path | str | None = None, tolerance=None,
             report["steps"]["pytorch_batched_timing"] = timings
             report["steps"]["breakdown_8k_c512"] = profile_pytorch_breakdown(
                 tokens=8192, chunk=512, reps=3)
+            report["steps"]["variant_benchmark"] = benchmark_chunk_variants(
+                tokens_list=(2048, 8192), chunk=512, reps=5)
+            report["steps"]["stage_compare_8k"] = benchmark_stage_compare(
+                tokens=8192, chunk=512, reps=5)
+            report["steps"]["fused_correctness"] = compare_fused_gpu(
+                tokens_list=(64, 2048), chunk=512)
         except Exception as exc:  # noqa: BLE001
             report["blockers"].append(f"PyTorch batched 对照失败: {type(exc).__name__}: {exc}")
     report["feasible"] = (not report["blockers"]
