@@ -331,15 +331,21 @@ def compare_fused_gpu(*, tokens_list=(64, 2048), chunk=512, heads=10, dk=64, dv=
         args = (t["q"], t["k"], t["v"], t["g"], t["b"], t["w"])
         dmax = float((-t["g"].detach()).amax())
         chunk_eff = max(1, min(chunk, int(40.0 / dmax))) if dmax > 0 else chunk
-        ref_inputs = [x.detach().requires_grad_(check_gradients and tokens <= 64) for x in args]
-        ref = gdn2_chunkwise_batched_forward(*ref_inputs, chunk=chunk, divide_by_sqrt_t=True,
-                                              l2norm_qk=True, chunk_eff_in=chunk_eff)
+        ref_base = [x.detach() for x in args]
+        ref_numeric = gdn2_chunkwise_batched_forward(*ref_base, chunk=chunk,
+                                                     divide_by_sqrt_t=True,
+                                                     l2norm_qk=True, chunk_eff_in=chunk_eff)
         row = {}
         for name, kwargs in (("fused_solve", dict(solve="reference")),
                              ("fused_blocked64", dict(solve="blocked", block=64))):
             try:
                 fused_inputs = [x.detach().requires_grad_(check_gradients and tokens <= 64)
                                 for x in args]
+                ref_inputs = [x.detach().requires_grad_(check_gradients and tokens <= 64)
+                              for x in args]
+                ref = gdn2_chunkwise_batched_forward(*ref_inputs, chunk=chunk,
+                                                     divide_by_sqrt_t=True,
+                                                     l2norm_qk=True, chunk_eff_in=chunk_eff)
                 got = chunkwise_fused(*fused_inputs, chunk=chunk, chunk_eff=chunk_eff, **kwargs)
             except ValueError as exc:
                 row[name] = dict(skipped=str(exc))
@@ -360,7 +366,9 @@ def compare_fused_gpu(*, tokens_list=(64, 2048), chunk=512, heads=10, dk=64, dv=
                 row[name]["grad_finite"] = all(bool(torch.isfinite(a.grad).all())
                                                 for a in fused_inputs)
         rows[f"t{tokens}"] = row
-    ok = all(v["finite"] and v["max_abs"] <= 5e-4 for r in rows.values() for v in r.values())
+    ok = all(v["finite"] and v["max_abs"] <= 5e-4
+             and v.get("grad_finite", True) and v.get("grad_max_abs", 0.0) <= 5e-4
+             for r in rows.values() for v in r.values())
     return dict(ok=ok, rows=rows, requested_chunk=chunk,
                 effective_chunk=chunk_eff, dmax=dmax, realistic_decay=True,
                 tolerance_abs=5e-4)
