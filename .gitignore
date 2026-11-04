@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+.pytest_cache/
+out/
+results/
+data/
+*.npy
+*.ready
+*.pt
+*.trace.json

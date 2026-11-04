@@ -1,0 +1,385 @@
+"""TileLang / FlashQLA 在 T4(SM75) 上承接 GDN-2 chunkwise 的可行性探测。
+
+设计约束：
+  * 不静默回退。依赖缺失、编译失败、数值不符都写入 blockers 并如实返回。
+  * 参考实现独立于 gdn2_ref：逐 token fp64 递推，便于发现移植中的公式错误。
+  * 本模块的 CPU 部分可被单元测试覆盖；GPU 部分只能由真实 GPU 运行证明。
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+import math
+import statistics
+import time
+from pathlib import Path
+
+import torch
+
+DEFAULT_TOLERANCE = dict(rtol=2e-3, atol=2e-4)
+
+
+def _version(module_name: str) -> str | None:
+    try:
+        return getattr(importlib.import_module(module_name), "__version__", "unknown")
+    except Exception:
+        return None
+
+
+def dist_info(dist_name: str) -> dict:
+    """按发行版名查询版本与顶层模块；导入名与包名经常不同，不能靠猜。"""
+    try:
+        from importlib.metadata import distribution
+    except Exception:  # noqa: BLE001
+        return dict(installed=False, version=None, top_level=[])
+    try:
+        dist = distribution(dist_name)
+    except Exception:  # noqa: BLE001
+        return dict(installed=False, version=None, top_level=[])
+    top_level = []
+    try:
+        text = dist.read_text("top_level.txt") or ""
+        top_level = [line.strip() for line in text.splitlines() if line.strip()]
+    except Exception:  # noqa: BLE001
+        pass
+    if not top_level:
+        names = set()
+        for f in dist.files or []:
+            parts = str(f).split("/")
+            if parts and parts[0].endswith(".py"):
+                names.add(parts[0][:-3])
+            elif len(parts) > 1 and not parts[0].endswith((".dist-info", ".data")):
+                names.add(parts[0])
+        top_level = sorted(names)
+    return dict(installed=True, version=dist.version, top_level=top_level)
+
+
+def environment() -> dict:
+    """记录影响结论的软硬件事实；GPU 信息缺失时明确标记。"""
+    info = dict(
+        torch=torch.__version__,
+        cuda_available=bool(torch.cuda.is_available()),
+        cuda_version=torch.version.cuda,
+        triton=_version("triton"),
+        tilelang_dist=dist_info("tilelang"),
+        flash_qla_dist=dist_info("flash-qla"),
+    )
+    if info["cuda_available"]:
+        props = torch.cuda.get_device_properties(0)
+        info.update(device=props.name, capability=list(torch.cuda.get_device_capability(0)),
+                    total_memory_bytes=props.total_memory)
+    else:
+        info.update(device=None, capability=None, total_memory_bytes=None)
+    return info
+
+
+def environment_blockers(info: dict, *, require_capability=None) -> list[str]:
+    blockers = []
+    if not info["cuda_available"]:
+        blockers.append("无 CUDA 设备：无法验证 TileLang 编译与 GPU 计时")
+    elif require_capability is not None and tuple(info["capability"]) != tuple(require_capability):
+        blockers.append(
+            f"设备 capability={info['capability']}，与目标 {list(require_capability)} 不符")
+    return blockers
+
+
+def _l2norm(x: torch.Tensor) -> torch.Tensor:
+    return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def reference_recurrence(q, k, v, g, b, w, *, divide_by_sqrt_t=True, l2norm_qk=True):
+    """独立的逐 token fp64 递推，作为设备无关的真值。
+
+    与 gdn2_ref 的批量实现刻意不复用代码，避免同一处公式错误在两边同时出现。
+    """
+    q, k, v, g, b, w = (t.double() for t in (q, k, v, g, b, w))
+    if l2norm_qk:
+        q, k = _l2norm(q), _l2norm(k)
+    B, T, H, dk = q.shape
+    # 设备必须跟随输入；否则 GPU 张量与 CPU 参考会在 einsum 处直接报错。
+    S = torch.zeros(B, H, dk, v.shape[-1], dtype=torch.float64, device=q.device)
+    outs = []
+    for t in range(T):
+        S_bar = g[:, t].exp().unsqueeze(-1) * S
+        r = torch.einsum("bhk,bhkv->bhv", b[:, t] * k[:, t], S_bar)
+        S = S_bar + k[:, t].unsqueeze(-1) * (w[:, t] * v[:, t] - r).unsqueeze(-2)
+        o = torch.einsum("bhk,bhkv->bhv", q[:, t], S)
+        if divide_by_sqrt_t:
+            o = o / math.sqrt(t + 1)
+        outs.append(o)
+    return torch.stack(outs, dim=1)
+
+
+def compare_backend(backend, tensors: dict, *, chunk: int, tolerance=None) -> dict:
+    """对同一输入比较 backend 与 fp64 真值；容差失败不抛异常，交由调用方判定。"""
+    tolerance = dict(DEFAULT_TOLERANCE if tolerance is None else tolerance)
+    expected = reference_recurrence(
+        tensors["q"], tensors["k"], tensors["v"], tensors["g"], tensors["b"], tensors["w"])
+    actual = backend(**tensors, chunk=chunk)
+    if actual.shape != expected.shape:
+        return dict(ok=False, reason=f"shape {tuple(actual.shape)} != {tuple(expected.shape)}")
+    diff = (actual.double() - expected).abs()
+    finite = bool(torch.isfinite(actual).all())
+    scale = expected.abs().clamp_min(1e-12)
+    ok = finite and bool(torch.all(diff <= tolerance["atol"] + tolerance["rtol"] * scale))
+    return dict(ok=ok, finite=finite, max_abs=float(diff.max()) if diff.numel() else 0.0,
+                mean_abs=float(diff.mean()) if diff.numel() else 0.0,
+                rtol=tolerance["rtol"], atol=tolerance["atol"],
+                reason="" if ok else "超出数值容差或出现非有限值")
+
+
+def make_tensors(*, device="cpu", batch=2, tokens=16, heads=3, dk=8, dv=8, seed=0,
+                 requires_grad=False):
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    shape = (batch, tokens, heads, dk)
+    q = torch.randn(shape, generator=gen)
+    k = torch.randn(shape, generator=gen)
+    v = torch.randn((batch, tokens, heads, dv), generator=gen)
+    g = -torch.rand(shape, generator=gen)
+    b = torch.rand(shape, generator=gen)
+    w = torch.rand((batch, tokens, heads, dv), generator=gen)
+    out = dict(q=q, k=k, v=v, g=g, b=b, w=w)
+    return {name: t.to(device).requires_grad_(requires_grad) for name, t in out.items()}
+
+
+def time_callable(fn, *, warmup=3, reps=10) -> dict:
+    """CUDA 事件计时；无 CUDA 时退化为墙钟并标注来源。"""
+    use_cuda = torch.cuda.is_available()
+    for _ in range(warmup):
+        fn()
+    if use_cuda:
+        torch.cuda.synchronize()
+    samples = []
+    for _ in range(reps):
+        if use_cuda:
+            start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+            start.record()
+            fn()
+            end.record()
+            torch.cuda.synchronize()
+            samples.append(start.elapsed_time(end))
+        else:
+            t0 = time.perf_counter()
+            fn()
+            samples.append((time.perf_counter() - t0) * 1000)
+    return dict(source="cuda_event_ms" if use_cuda else "wall_ms", samples=samples,
+                median_ms=statistics.median(samples), min_ms=min(samples),
+                max_ms=max(samples), reps=reps)
+
+
+def _tilelang_smoke_compile() -> dict:
+    """在真实设备上编译并运行一个最小 kernel，验证 SM75 目标可用。
+
+    TileLang 各版本 API 有差异，失败时保留完整异常原文，供下一轮修正；
+    这里绝不把"能导入"当作"能编译"。
+    """
+    try:
+        import tilelang
+        import tilelang.language as T
+    except Exception as exc:  # noqa: BLE001 - 需要把完整原因写入报告
+        return dict(ok=False, stage="import", error=f"{type(exc).__name__}: {exc}")
+    version = getattr(tilelang, "__version__", "unknown")
+    if not torch.cuda.is_available():
+        return dict(ok=False, stage="device", version=version, error="需要 CUDA 才能编译")
+
+    n, block = 1024, 128
+
+    try:
+        @tilelang.jit
+        def add_kernel():
+            @T.prim_func
+            def main(A: T.Tensor((n,), "float32"), B: T.Tensor((n,), "float32"),
+                     C: T.Tensor((n,), "float32")):
+                with T.Kernel(T.ceildiv(n, block), threads=block) as bx:
+                    for i in T.Parallel(block):
+                        idx = bx * block + i
+                        C[idx] = A[idx] + B[idx]
+
+            return main
+
+        kernel = add_kernel()
+        a = torch.randn(n, device="cuda")
+        b = torch.randn(n, device="cuda")
+        out = torch.empty(n, device="cuda")
+        kernel(a, b, out)
+        torch.cuda.synchronize()
+        exact = bool(torch.equal(out, a + b))
+        return dict(ok=exact, stage="run", version=version,
+                    error="" if exact else "kernel 输出与 torch 加法不一致")
+    except Exception as exc:  # noqa: BLE001
+        return dict(ok=False, stage="compile", version=version,
+                    error=f"{type(exc).__name__}: {exc}")
+
+
+def discover_flash_qla(keywords=("gdn", "chunk", "delta", "fused")) -> dict:
+    """发现 FlashQLA 的导入入口与疑似 GDN 算子名。
+
+    只做列举，不猜测签名去调用；真正接线要等看到实际 API 后再做。
+    """
+    info = dist_info("flash-qla")
+    report = dict(dist=info, modules={}, candidates=[])
+    for module_name in info["top_level"]:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # noqa: BLE001
+            report["modules"][module_name] = f"{type(exc).__name__}: {exc}"
+            continue
+        names = [n for n in dir(module)
+                 if any(k in n.lower() for k in keywords)
+                 and callable(getattr(module, n, None))]
+        report["modules"][module_name] = dict(ok=True, candidates=names[:20])
+        report["candidates"].extend(f"{module_name}.{n}" for n in names[:20])
+    return report
+
+
+def profile_pytorch_breakdown(*, tokens=8192, chunk=512, heads=10, dk=64, dv=64,
+                              reps=3, device="cuda") -> dict:
+    """把 chunkwise 路径拆成阶段计时，定位该先优化哪一段。
+
+    与 gdn2_ref.gdn2_chunkwise_batched_forward 的公式一致，但只用于计时，
+    不参与正确性判定；任何数值问题都由 compare_backend 单独检查。
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        return dict(ok=False, error="需要 CUDA")
+    t = make_tensors(device=device, batch=1, tokens=tokens, heads=heads, dk=dk, dv=dv, seed=1)
+    q, k, v, g, b, w = (x.float() for x in (t["q"], t["k"], t["v"], t["g"], t["b"], t["w"]))
+    l2 = _l2norm
+    n = (tokens + chunk - 1) // chunk
+    pad = n * chunk - tokens
+    tril_lt = torch.ones(chunk, chunk, device=device, dtype=torch.bool).tril(-1)
+    tril_le = torch.ones(chunk, chunk, device=device, dtype=torch.bool).tril()
+
+    def prep():
+        K = l2(k)
+        Q = l2(q)
+        def window(x):
+            part = x if not pad else torch.cat(
+                (x, x.new_zeros(1, pad, heads, x.shape[-1])), dim=1)
+            return part.reshape(1, n, chunk, heads, x.shape[-1]).permute(0, 1, 3, 2, 4)
+        Qw, Kw, Vw, Gw, Bw, Ww = (window(x) for x in (Q, K, v, g, b, w))
+        G = Gw.cumsum(dim=-2)
+        expG = G.exp()
+        Bk_e = (Bw * Kw) * expG
+        Q_e = Qw * expG
+        Ke_i = Kw * torch.exp(-G.clamp(min=-40.0))
+        return Q_e, Ke_i, Bk_e, Vw, Ww, expG
+
+    def build_masks(Q_e, Ke_i, Bk_e, Vw, Ww):
+        A = (Bk_e @ Ke_i.transpose(-1, -2)).masked_fill(~tril_lt, 0.0).float()
+        P = (Q_e @ Ke_i.transpose(-1, -2)).masked_fill(~tril_le, 0.0)
+        rhs = torch.cat((Ww * Vw, Bk_e), dim=-1).float()
+        return A, P, rhs
+
+    def solve(A, rhs):
+        L = torch.eye(chunk, device=device, dtype=torch.float32) + A
+        return torch.linalg.solve_triangular(L, rhs, upper=False)
+
+    def recurrence(P, Q_e, Ke_i, expG, X):
+        X0, X1 = X[..., :dv], X[..., dv:]
+        S = torch.zeros(1, heads, dk, dv, device=device, dtype=torch.float32)
+        outs = []
+        for idx in range(n):
+            x = X0[:, idx] - X1[:, idx] @ S
+            out = Q_e[:, idx] @ S + P[:, idx] @ x
+            outs.append(out)
+            decay = expG[:, idx, :, -1]
+            S = decay.unsqueeze(-1) * S + ((decay.unsqueeze(-2) * Ke_i[:, idx]).transpose(-1, -2) @ x)
+        return torch.cat(outs, dim=1)
+
+    def full():
+        Q_e, Ke_i, Bk_e, Vw, Ww, expG = prep()
+        A, P, rhs = build_masks(Q_e, Ke_i, Bk_e, Vw, Ww)
+        X = solve(A, rhs)
+        return recurrence(P, Q_e, Ke_i, expG, X)
+
+    stages = {}
+    Q_e, Ke_i, Bk_e, Vw, Ww, expG = prep()
+    A, P, rhs = build_masks(Q_e, Ke_i, Bk_e, Vw, Ww)
+    X = solve(A, rhs)
+    stages["prep"] = time_callable(prep, warmup=1, reps=reps)
+    stages["masks"] = time_callable(lambda: build_masks(Q_e, Ke_i, Bk_e, Vw, Ww),
+                                    warmup=1, reps=reps)
+    stages["trisolve"] = time_callable(lambda: solve(A, rhs), warmup=1, reps=reps)
+    stages["recurrence"] = time_callable(lambda: recurrence(P, Q_e, Ke_i, expG, X),
+                                         warmup=1, reps=reps)
+    stages["total"] = time_callable(full, warmup=1, reps=reps)
+    return dict(ok=True, tokens=tokens, chunk=chunk, heads=heads, dk=dk, dv=dv,
+                chunks=n, stages={k: dict(median_ms=v["median_ms"], source=v["source"])
+                                  for k, v in stages.items()})
+
+
+def probe_matmul_baseline(*, device="cuda", shape=(2048, 64, 64), reps=10) -> dict:
+    """给出 torch 在代表性 chunk 规模上的基线，作为 TileLang 后续对比的分母。
+
+    (2048, 64, 64) 对应 8K 序列、chunk=64 时约 B*H*N 个 64x64 块乘。
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        return dict(ok=False, error="需要 CUDA")
+    a = torch.randn(shape, device=device)
+    b = torch.randn(shape, device=device)
+    timing = time_callable(lambda: torch.matmul(a, b), reps=reps)
+    return dict(ok=True, shape=list(shape), timing=timing)
+
+
+def run_probe(*, output: Path | str | None = None, tolerance=None,
+              require_capability=(7, 5)) -> dict:
+    """执行可行性探测。返回 report；任何前置条件失败都写入 blockers。"""
+    report = dict(environment=environment(), blockers=[], steps={}, feasible=False)
+    report["blockers"].extend(
+        environment_blockers(report["environment"], require_capability=require_capability))
+    try:
+        report["steps"]["flash_qla"] = discover_flash_qla()
+    except Exception as exc:  # noqa: BLE001
+        report["steps"]["flash_qla"] = dict(error=f"{type(exc).__name__}: {exc}")
+    report["steps"]["tilelang"] = _tilelang_smoke_compile()
+    if not report["steps"]["tilelang"].get("ok"):
+        report["blockers"].append("TileLang 不可用或 API 不符: "
+                                 + report["steps"]["tilelang"].get("error", "unknown"))
+    if report["environment"]["cuda_available"]:
+        report["steps"]["torch_matmul_baseline"] = probe_matmul_baseline()
+        try:
+            tensors = make_tensors(device="cuda", batch=2, tokens=64, heads=4, dk=16, dv=16)
+            from hcl_tr.models.gdn2_ref import gdn2_chunkwise_batched_forward
+
+            def backend(**kw):
+                chunk = kw.pop("chunk")
+                return gdn2_chunkwise_batched_forward(
+                    kw["q"], kw["k"], kw["v"], kw["g"], kw["b"], kw["w"],
+                    chunk=chunk, divide_by_sqrt_t=True, l2norm_qk=True)
+
+            report["steps"]["pytorch_batched_numeric"] = compare_backend(
+                backend, tensors, chunk=16, tolerance=tolerance)
+            # 生产配置基线：B=1,H=10,dk=dv=64,chunk=512（见 scripts/ab_probe.py）。
+            timings = {}
+            for tokens in (2048, 8192):
+                prod = make_tensors(device="cuda", batch=1, tokens=tokens, heads=10,
+                                    dk=64, dv=64, seed=1)
+                timings[f"t{tokens}_c512"] = time_callable(
+                    lambda prod=prod: backend(**prod, chunk=512), warmup=1, reps=3)
+            report["steps"]["pytorch_batched_timing"] = timings
+            report["steps"]["breakdown_8k_c512"] = profile_pytorch_breakdown(
+                tokens=8192, chunk=512, reps=3)
+        except Exception as exc:  # noqa: BLE001
+            report["blockers"].append(f"PyTorch batched 对照失败: {type(exc).__name__}: {exc}")
+    report["feasible"] = (not report["blockers"]
+                          and report["steps"].get("pytorch_batched_numeric", {}).get("ok", False))
+    report["note"] = ("本轮只验证工具链与对照基线；完整 GDN-2 TileLang kernel 尚未移植，"
+                      "因此 feasible=True 仅表示可以进入下一步，不代表已有加速。")
+    if output is not None:
+        Path(output).write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+    return report
+
+
+def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=Path("/kaggle/working/feasibility.json"))
+    args = parser.parse_args()
+    report = run_probe(output=args.output)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    return 0 if report["feasible"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

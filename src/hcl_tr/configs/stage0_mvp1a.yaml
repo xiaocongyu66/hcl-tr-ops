@@ -1,0 +1,83 @@
+# 阶段 0 / MVP-1a：GDN-2 + 3:1 全注意力（SLA/QED 关闭）
+# 对应计划书 §12 第 4 步
+model:
+  vocab_size: 64000        # 自训 64k 中英双语 BPE（见 data/tokenizer.py）
+  d_model: 640            # 64k 词表下守住 ~100M（实测 95.06M）
+  n_layer: 12
+  n_head: 10              # head_dim = 64（必须整除）
+  attn_ratio: 4            # 3 层 GDN-2 + 1 层全注意力
+  tie_embeddings: true
+  use_qed: false           # MVP-1c 才开
+  use_sla: false           # MVP-1b 才开
+  qk_norm_full_attn: true  # per-head RMSNorm，RoPE 之前
+  gdn2_internal_qk_norm: false
+  divide_by_sqrt_t: true
+  output_gate: true
+  output_gate_bias_init: 1.0
+  # GDN-2 chunkwise 的 T4 实测配置：chunk=512 + 批量预计算跨块 L^-1。
+  # chunk 越大单次 GEMM 越高效，但指数可表示范围随 chunk 收缩，
+  # 运行时仍会按 dmax 做安全 chunk 校准（backbone.py）。
+  gdn2_chunk: 512
+  gdn2_chunk_backend: batched
+  gdn2_matmul_dtype: fp32
+
+# 训练种子（所有归因组必须相同）
+seed: 0
+
+# 数据 mix（计划书 §6）：15% 中文。/ data_mix_hash 由
+# data/pipeline.py::build_frozen_manifest 产出后填回，未填前不得开跑 10B。
+data:
+  tokenizer: trained_64k_bpe
+  vocab_size: 64000
+  sources:
+    en_c4:
+      kaggle: botcanlearn/c4-corpus-hq-llama-factory-jsonl
+      weight: 0.45
+    en_fineweb_edu:
+      kaggle: archlegend/fw-edu-2013-20
+      weight: 0.40
+    zh_fineweb_edu:
+      hf: opencsg/chinese-fineweb-edu-v2
+      weight: 0.15
+  edu_min_score: 0.5
+  dedup_threshold: 0.8
+  decontam_ngram: 13
+  decontam_max_drop: 0.01
+  data_mix_hash: null    # 冻结后写入；null 表示尚未冻结
+
+optimizer:
+  name: AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  weight_decay: 0.1
+
+grad_clip: 1.0
+
+# T4 双卡（16GB×2）实机配置。
+# 显存估算：8K 序列下全注意力层 attn 矩阵 B×H×T×T×2B，
+#   mb=2 时单层 ~3GB（正+反 ~6GB），mb=4 时 ~6GB（正+反 ~12GB）→ 16GB 卡 mb=4 必 OOM。
+# 因此 mb=2；用 grad_accum 补足 global_batch_tokens。
+batch:
+  micro_batch_per_gpu: 2
+  seq_len: 8192
+  grad_accum: 8          # 2×8×8192×2卡 = 262144 global tokens
+  n_gpu: 2
+  global_batch_tokens: 262144
+
+lr:
+  sweep: [2e-4, 3e-4, 4e-4]
+  schedule: token_level_cosine
+  warmup_tokens: 1_000_000_000
+  short_run_tokens: 1_000_000_000
+  full_run_tokens: 10_000_000_000
+
+train_tokens: 10_000_000_000
+seq_len: 8192
+
+monitor:
+  gdn2_gate_entropy_every_n_steps: 100
+  gdn2_state_norm_every_n_steps: 500
+  per_layer_grad_norm_every_n_steps: 100
+  loss_spike_threshold: "3x running median"
+  head_entropy_every_n_steps: 100
+  head_entropy_collapse_threshold: 0.05

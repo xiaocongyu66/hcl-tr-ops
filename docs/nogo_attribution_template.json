@@ -1,0 +1,45 @@
+{
+  "verdict": "NoGo",
+  "reasons": [
+    "示例：相对 baseline <80%"
+  ],
+  "evidence": {
+    "results": {
+      "absolute_length": 0,
+      "seed_results": [
+        0,
+        0,
+        0
+      ]
+    },
+    "baseline": {
+      "baseline_length": 0
+    },
+    "relative_to_baseline": 0.0
+  },
+  "source_lock_sha256": "<sha256 of SOURCE_LOCK.md>",
+  "prereg_yaml_sha256": "<sha256 of sniah1_ruler_prereg_v1.0.yaml>",
+  "fixture_report": [
+    {
+      "name": "GDN-2 状态转移",
+      "status": "pass",
+      "max_abs_err": 0.0,
+      "dtype": "float32"
+    }
+  ],
+  "allowed_actions": [
+    "escalate_model_scale_300m_1b",
+    "increase_long_text_data_ratio",
+    "mark_nogo",
+    "save_attribution_json",
+    "stop_training"
+  ],
+  "forbidden_actions": [
+    "change_gate_threshold",
+    "redefine_usable_length",
+    "silent_is_clip",
+    "substitute_implementation",
+    "swap_baseline",
+    "tune_lr"
+  ]
+}

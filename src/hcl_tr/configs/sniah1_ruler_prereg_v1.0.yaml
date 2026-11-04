@@ -1,0 +1,43 @@
+# S-NIAH-1 / RULER 评估口径 —— 预注册（PREREGISTERED）
+# 冻结日期: 2026-10-29
+# 任何修改必须升版本号并重新冻结 hash；Go/NoGo 只认同名版本。
+# 本文件的 sha256 由 scripts/freeze_prereg.py 写入 baseline JSON 的 eval_protocol_hash。
+
+name: sniah1_ruler_prereg
+version: "1.0"
+
+lengths: [512, 1024, 2048, 4096, 8192]
+samples_per_length: 100
+needle_positions: "均匀采样 10 个位置"
+key_value_types: ["word_key", "number_key"]
+accuracy_ci: Wilson_95
+
+usable_length_definition:
+  rule: "最大 L 使 acc(L) >= 0.90 且该长度 95% CI 下界 >= 0.85"
+  # 可用长度必须由预注册长度点上的测量值判定，不允许重定义
+
+interpolation: "仅在预注册长度点之间线性插值；不向未采样长度外推"
+retry_on_failure: false
+
+training_length: 8192
+zero_shot_extrapolation_lengths: [16384]   # 标记，不参与 Go/NoGo
+
+# 训练期评估必须使用全精度 KV cache 与未压缩 recurrent state。
+# DASC / MoE-nD 只在部署期启用，不得参与此处任何打分。
+precision:
+  training_eval_kv_cache: full_precision
+  training_eval_recurrent_state: uncompressed
+  dasc_enabled: false
+  moe_nd_enabled: false
+
+# Go/NoGo 主指标（只有这一项）
+primary_metric: usable_context_length
+
+# 辅助指标（仅归因，不进 Go/NoGo）
+auxiliary_metrics:
+  - ppl
+  - needle_recall
+  - gdn2_gate_entropy
+  - gdn2_state_norm
+  - head_entropy_collapse
+  - idac_token_overhead

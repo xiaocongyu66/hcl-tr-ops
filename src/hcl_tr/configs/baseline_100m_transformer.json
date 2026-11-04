@@ -1,0 +1,23 @@
+{
+  "name": "baseline_100m_transformer",
+  "checkpoint": "vendor/baselines/baseline_100m.pt",
+  "checkpoint_sha256": "<FILL_ON_FREEZE>",
+  "tokenizer": "TinyLlama v1.1",
+  "tokenizer_sha256": "<FILL_ON_FREEZE>",
+  "data_mix_hash": "<FILL_ON_FREEZE>",
+  "train_tokens": 10000000000,
+  "eval_protocol": "sniah1_ruler_prereg@1.0",
+  "eval_protocol_file": "src/hcl_tr/configs/sniah1_ruler_prereg_v1.0.yaml",
+  "eval_protocol_hash": "a1b30654a6052a785c0bdb50ae01198d6d81ffc373a8f104116e20aa8f5bc08b",
+  "seed_results": {
+    "seed0": null,
+    "seed1": null,
+    "seed2": null
+  },
+  "frozen_at": "2026-10-29",
+  "notes": [
+    "本文件一旦 frozen_at 落定，禁止运行时重训 baseline。",
+    "seed_results 只有在该 baseline 实际跑完 S-NIAH-1 后才填数；null 表示尚未测量。",
+    "Go/NoGo 的 relative_to_baseline 与 absolute_length 均以此文件记录为本。"
+  ]
+}

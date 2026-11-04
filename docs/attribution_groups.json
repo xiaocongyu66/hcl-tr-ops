@@ -1,0 +1,58 @@
+{
+  "groups": [
+    {
+      "id": "base_t",
+      "name": "Base-T",
+      "in_gonogo": true,
+      "config_path": "src/hcl_tr/configs/attribution/base_t.yaml",
+      "blocked": false,
+      "blocked_by": null,
+      "note": "100M Transformer baseline，指向冻结 checkpoint，禁止重训"
+    },
+    {
+      "id": "gdn_qed",
+      "name": "+GDN/QED",
+      "in_gonogo": true,
+      "config_path": "src/hcl_tr/configs/attribution/gdn_qed.yaml",
+      "blocked": false,
+      "blocked_by": null,
+      "note": ""
+    },
+    {
+      "id": "sla",
+      "name": "+SLA",
+      "in_gonogo": true,
+      "config_path": "src/hcl_tr/configs/attribution/sla.yaml",
+      "blocked": false,
+      "blocked_by": null,
+      "note": ""
+    },
+    {
+      "id": "spar_when2think",
+      "name": "+SPAR/When2Think",
+      "in_gonogo": true,
+      "config_path": "src/hcl_tr/configs/attribution/spar_when2think.yaml",
+      "blocked": true,
+      "blocked_by": "IDAC",
+      "note": "IDAC 的 RLVR 训练目标未实现（§12 阶段2）；SPAR 已实现"
+    },
+    {
+      "id": "spar_only",
+      "name": "+SPAR only",
+      "in_gonogo": false,
+      "config_path": "src/hcl_tr/configs/attribution/spar_only.yaml",
+      "blocked": false,
+      "blocked_by": null,
+      "note": "诊断：相对 +GDN/QED 只加 SPAR"
+    },
+    {
+      "id": "when2think_only",
+      "name": "+When2Think only",
+      "in_gonogo": false,
+      "config_path": "src/hcl_tr/configs/attribution/when2think_only.yaml",
+      "blocked": true,
+      "blocked_by": "IDAC",
+      "note": "诊断：相对 +GDN/QED 只加 IDAC（未实现）"
+    }
+  ]
+}

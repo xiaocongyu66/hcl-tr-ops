@@ -1,0 +1,69 @@
+model:
+  vocab_size: 64000
+  d_model: 640
+  n_layer: 16
+  n_head: 10
+  attn_ratio: 1
+  tie_embeddings: true
+  use_qed: false
+  use_sla: false
+  qk_norm_full_attn: true
+  gdn2_internal_qk_norm: false
+  divide_by_sqrt_t: true
+  output_gate: true
+  output_gate_bias_init: 1.0
+  use_spar: false
+  use_idac: false
+seed: 0
+data:
+  tokenizer: trained_64k_bpe
+  vocab_size: 64000
+  sources:
+    en_c4:
+      kaggle: botcanlearn/c4-corpus-hq-llama-factory-jsonl
+      weight: 0.45
+    en_fineweb_edu:
+      kaggle: archlegend/fw-edu-2013-20
+      weight: 0.4
+    zh_fineweb_edu:
+      hf: opencsg/chinese-fineweb-edu-v2
+      weight: 0.15
+  edu_min_score: 0.5
+  dedup_threshold: 0.8
+  decontam_ngram: 13
+  decontam_max_drop: 0.01
+  data_mix_hash: null
+optimizer:
+  name: AdamW
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1e-8
+  weight_decay: 0.1
+grad_clip: 1.0
+batch:
+  micro_batch_per_gpu: 2
+  seq_len: 8192
+  grad_accum: 8
+  n_gpu: 2
+  global_batch_tokens: 262144
+lr:
+  sweep:
+  - 2e-4
+  - 3e-4
+  - 4e-4
+  schedule: token_level_cosine
+  warmup_tokens: 1000000000
+  short_run_tokens: 1000000000
+  full_run_tokens: 10000000000
+train_tokens: 10000000000
+seq_len: 8192
+monitor:
+  gdn2_gate_entropy_every_n_steps: 100
+  gdn2_state_norm_every_n_steps: 500
+  per_layer_grad_norm_every_n_steps: 100
+  loss_spike_threshold: 3x running median
+  head_entropy_every_n_steps: 100
+  head_entropy_collapse_threshold: 0.05
+attribution_group: base_t
+in_gonogo: true

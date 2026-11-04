@@ -1,0 +1,5 @@
+# 本机/CI 的 CPU-only 依赖（用于 fixture 数值测试）
+# torch 由 CI 通过 --index-url .../cpu 单独安装，此处不重复锁 torch 版本
+pytest>=8
+numpy>=1.26
+PyYAML>=6.0
