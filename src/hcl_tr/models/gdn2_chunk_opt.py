@@ -32,9 +32,10 @@ def chunkwise_fused_compiled(*args, **kwargs):
     """
     fn = _COMPILED_FUSED.get("fn")
     if fn is None:
-        fn = torch.compile(chunkwise_fused, dynamic=False)
+        fn = torch.compile(_chunkwise_fused_impl, dynamic=False)
         _COMPILED_FUSED["fn"] = fn
-    return fn(*args, **kwargs)
+    with torch.autocast(device_type=args[0].device.type, enabled=False):
+        return fn(*args, **kwargs)
 
 
 def _masks(chunk: int, device):
@@ -97,7 +98,25 @@ def chunkwise_fused(
     """等价于 gdn2_ref.gdn2_chunkwise_batched_forward 的融合实现。
 
     ``solve``: "blocked"（默认）或 "reference"（整块 solve_triangular）。
+
+    整个算子显式关闭 autocast：指数因子最大可达 e^{chunk×dmax/2}，
+    fp16 上界只有 65504，若被 autocast 降精度会直接溢出成 inf → NaN。
+    调用方即使处于 autocast(fp16) 中，这里也必须按 fp32 计算。
     """
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        return _chunkwise_fused_impl(
+            q, k, v, g, b, w, chunk=chunk, divide_by_sqrt_t=divide_by_sqrt_t,
+            l2norm_qk=l2norm_qk, solve=solve, block=block,
+            matmul_dtype=matmul_dtype, chunk_eff=chunk_eff,
+            chunk_override=chunk_override, neg_clamp=neg_clamp)
+
+
+def _chunkwise_fused_impl(
+    q, k, v, g, b, w, *, chunk: int = 512, divide_by_sqrt_t: bool = True,
+    l2norm_qk: bool = True, solve: str = "blocked", block: int = 64,
+    matmul_dtype: torch.dtype = torch.float32, chunk_eff: int | None = None,
+    chunk_override: int | None = None, neg_clamp: float = 40.0,
+):
     if solve not in ("blocked", "reference"):
         raise ValueError(f"不支持的 solve 模式: {solve}")
     batch, tokens, heads, dk = q.shape

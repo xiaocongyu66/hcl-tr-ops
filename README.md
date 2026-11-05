@@ -17,6 +17,7 @@ Hybrid CMM-Linear with Learned Rethink Triggering —— **混合骨干（3:1 GD
 | 融合后端（中点平移，chunk=86）2K / 8K | 5.6 ms / 19.1 ms（**3.6× / 5.6×**） |
 | 融合后端对 fp64 真值误差（chunk 21/43/86） | `7.6e-08` / `1.3e-07` / `2.1e-07` |
 | 融合后端梯度对准确基准的最大误差 | `7.2e-07`（chunk 86，全部输入） |
+| autocast 下的融合算子 | **必须显式关闭**：fp16 会把 `e^80` 级因子溢出成 NaN（已修复，有 CUDA 回归测试） |
 | 融合 RoPE（Triton）数值 | 输出与输入梯度均通过（fp32 容差 1e-5，fp16 容差 5e-3） |
 | 融合 RoPE 端到端收益 | **没有**：2K AMP 12.35 ms vs torch 6.28 ms |
 | TileLang 0.1.15 在 SM75 | 编译并运行成功 |

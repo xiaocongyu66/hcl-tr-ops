@@ -267,7 +267,11 @@ class GDN2Layer(nn.Module):
                 with torch.no_grad():
                     dmax = float((-g.float()).amax()) if g.numel() else 0.0
                 if not math.isfinite(dmax):
-                    raise ValueError("GDN2 衰减包含 NaN/Inf，停止训练")
+                    bad = int((~torch.isfinite(g)).sum())
+                    raise ValueError(
+                        f"GDN2 衰减包含 NaN/Inf，停止训练（dmax={dmax}, "
+                        f"非有限元素={bad}/{g.numel()}, g范围="
+                        f"[{float(g.min())}, {float(g.max())}]）")
                 if self.matmul_dtype == torch.float16:
                     safe = 10.0
                 elif self.chunk_backend == "fused":

@@ -18,6 +18,27 @@ def _inputs(batch=2, tokens=40, heads=2, dk=8, dv=6, seed=0):
     return q, k, v, g, b, w
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='需要 CUDA 验证 fp16 autocast')
+def test_fused_disables_autocast_on_cuda():
+    """回归：autocast(fp16) 下 @ 会被降精度，指数因子溢出成 inf → NaN。
+
+    算子内部必须显式关闭 autocast，输出保持 fp32 且与无 autocast 的结果一致。
+    g 放大后单因子达到 ~e^14，远超 fp16 上限 65504，能真实触发溢出。
+    """
+    from hcl_tr.models.gdn2_chunk_opt import _chunkwise_fused_impl
+
+    q, k, v, g, b, w = _inputs(batch=1, tokens=32, heads=2, dk=8, dv=6, seed=3)
+    args = [t.cuda() for t in (q, k, v, g * 3.5, b, w)]
+    expected = chunkwise_fused(*args, chunk=8, solve='reference', neg_clamp=80.0)
+    with torch.autocast('cuda', dtype=torch.float16):
+        raw = _chunkwise_fused_impl(*args, chunk=8, solve='reference', neg_clamp=80.0)
+        got = chunkwise_fused(*args, chunk=8, solve='reference', neg_clamp=80.0)
+    assert not torch.isfinite(raw).all(), '该用例应能复现 autocast 溢出'
+    assert got.dtype == torch.float32
+    assert torch.isfinite(got).all()
+    torch.testing.assert_close(got, expected, atol=2e-5, rtol=2e-5)
+
+
 @pytest.mark.parametrize('solve', ['reference', 'blocked'])
 @pytest.mark.parametrize('chunk,padding', [(8, 0), (8, 4), (10, 0)])
 def test_matches_reference_implementation(solve, chunk, padding):
