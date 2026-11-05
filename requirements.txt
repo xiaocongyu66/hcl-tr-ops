@@ -6,5 +6,6 @@ einops>=0.7
 flash-linear-attention>=0.6.0
 transformers>=4.40
 datasets>=2.19
+tokenizers>=0.15
 numpy>=1.26
 PyYAML>=6.0

@@ -573,6 +573,38 @@ def benchmark_stage_compare(*, tokens=8192, chunk=512, heads=10, dk=64, dv=64,
     return dict(ok=True, tokens=tokens, chunk=chunk, reps=reps, results=out)
 
 
+def profile_fused_kernels(*, tokens=8192, chunk=86, heads=10, dk=64, dv=64,
+                          device="cuda", top=12) -> dict:
+    """用 torch.profiler 看融合实现里 GPU kernel 的真实耗时分布。"""
+    if device == "cuda" and not torch.cuda.is_available():
+        return dict(ok=False, error="需要 CUDA")
+    from hcl_tr.models.gdn2_chunk_opt import chunkwise_fused
+    t = make_tensors(device=device, batch=1, tokens=tokens, heads=heads, dk=dk, dv=dv,
+                     seed=1, realistic_decay=True)
+    args = (t["q"], t["k"], t["v"], t["g"], t["b"], t["w"])
+    dmax = float((-t["g"].detach()).amax())
+    ce = max(1, min(chunk, int(160.0 / dmax))) if dmax > 0 else chunk
+    run = lambda: chunkwise_fused(*args, chunk=ce, chunk_eff=ce, solve="reference",
+                                  neg_clamp=80.0)
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    from torch.profiler import profile, ProfilerActivity
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(5):
+            run()
+        torch.cuda.synchronize()
+    rows = []
+    for evt in prof.key_averages():
+        if evt.self_device_time_total > 0:
+            rows.append(dict(name=evt.key, self_ms=evt.self_device_time_total / 5.0,
+                             calls_per_iter=evt.count / 5.0))
+    rows.sort(key=lambda r: r["self_ms"], reverse=True)
+    total = sum(r["self_ms"] for r in rows)
+    return dict(ok=True, tokens=tokens, chunk=ce, total_ms=total,
+                top=rows[:top], kernel_count=sum(r["calls_per_iter"] for r in rows))
+
+
 def benchmark_chunk_variants(*, tokens_list=(2048, 8192), chunk=512, heads=10, dk=64,
                              dv=64, reps=5, device="cuda") -> dict:
     """同场对比：现有批量实现 vs 融合 A/P vs 融合 + 分块前代。
@@ -711,6 +743,8 @@ def run_probe(*, output: Path | str | None = None, tolerance=None,
                 tokens_list=(2048, 8192), chunk=86, reps=5)
             report["steps"]["compiled_gradients"] = compare_compiled_gradients(
                 tokens=256, chunk=86, heads=10, dk=64, dv=64)
+            report["steps"]["fused_profile"] = profile_fused_kernels(
+                tokens=8192, chunk=86, heads=10, dk=64, dv=64)
         except Exception as exc:  # noqa: BLE001
             report["blockers"].append(f"PyTorch batched 对照失败: {type(exc).__name__}: {exc}")
     report["feasible"] = (not report["blockers"]
