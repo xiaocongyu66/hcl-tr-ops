@@ -416,6 +416,104 @@ def compare_widestep_truth(*, tokens=256, heads=10, dk=64, dv=64, device="cuda")
                 grad_each_max_abs=grad_err, grad_ok=grad_ok, tolerance_abs=1e-5)
 
 
+def compare_compiled_gradients(*, tokens=256, chunk=86, heads=10, dk=64, dv=64,
+                               device="cuda") -> dict:
+    """torch.compile 版本的前向与反向都必须和 eager 一致（训练可用性门槛）。"""
+    if device == "cuda" and not torch.cuda.is_available():
+        return dict(ok=False, error="需要 CUDA")
+    from hcl_tr.models.gdn2_chunk_opt import chunkwise_fused, chunkwise_fused_compiled
+    t = make_tensors(device=device, batch=1, tokens=tokens, heads=heads, dk=dk, dv=dv,
+                     seed=13, realistic_decay=True)
+    base = [t["q"], t["k"], t["v"], t["g"], t["b"], t["w"]]
+    eager_in = [x.detach().requires_grad_(True) for x in base]
+    comp_in = [x.detach().requires_grad_(True) for x in base]
+    eager = chunkwise_fused(*eager_in, chunk=chunk, chunk_eff=chunk,
+                            solve="reference", neg_clamp=80.0)
+    compiled = chunkwise_fused_compiled(*comp_in, chunk=chunk, chunk_eff=chunk,
+                                        solve="reference", neg_clamp=80.0)
+    fwd = float((compiled.float() - eager.float()).abs().max())
+    weight = torch.randn_like(eager)
+    (eager * weight).sum().backward()
+    (compiled * weight).sum().backward()
+    grads = [float((a.grad - b.grad).abs().max()) for a, b in zip(comp_in, eager_in)]
+    ok = fwd <= 1e-5 and all(g <= 1e-4 and bool(torch.isfinite(a.grad).all())
+                             for g, a in zip(grads, comp_in))
+    return dict(ok=ok, tokens=tokens, chunk=chunk, forward_max_abs=fwd,
+                grad_each_max_abs=grads, grad_max_abs=max(grads))
+
+
+def benchmark_torch_features(*, tokens_list=(2048, 8192), chunk=86, heads=10, dk=64, dv=64,
+                             reps=5, device="cuda") -> dict:
+    """测试可开关的运行时特性：torch.compile 三种模式与精度设置。
+
+    每个模式独立 try/except：某一个不可用不应导致整份报告失败。
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        return dict(ok=False, error="需要 CUDA")
+    from hcl_tr.models.gdn2_chunk_opt import chunkwise_fused
+
+    caps = dict(
+        torch=torch.__version__,
+        compile_available=hasattr(torch, "compile"),
+        tf32_allow=bool(torch.backends.cuda.matmul.allow_tf32),
+        fp32_matmul_precision=torch.get_float32_matmul_precision(),
+        bf16_supported=bool(torch.cuda.is_bf16_supported()) if device == "cuda" else False,
+        capability=list(torch.cuda.get_device_capability(0)) if device == "cuda" else None,
+    )
+
+    if device == "cuda":
+        _warm_clocks()
+
+    rows = {}
+    # 基准：eager
+    eager_times = {}
+    for tokens in tokens_list:
+        t = make_tensors(device=device, batch=1, tokens=tokens, heads=heads, dk=dk, dv=dv,
+                         seed=1, realistic_decay=True)
+        args = (t["q"], t["k"], t["v"], t["g"], t["b"], t["w"])
+        dmax = float((-t["g"].detach()).amax())
+        ce = max(1, min(chunk, int(160.0 / dmax))) if dmax > 0 else chunk
+        timing = time_callable(lambda: chunkwise_fused(*args, chunk=ce, chunk_eff=ce,
+                                                       solve="reference", neg_clamp=80.0),
+                               warmup=2, reps=reps)
+        eager_times[f"t{tokens}"] = timing["median_ms"]
+
+    modes = ("default", "reduce-overhead", "max-autotune")
+    for mode in modes:
+        if not hasattr(torch, "compile"):
+            rows[mode] = dict(error="torch.compile 不可用")
+            continue
+        try:
+            compiled = torch.compile(chunkwise_fused, mode=mode, dynamic=False)
+            row = {}
+            for tokens in tokens_list:
+                t = make_tensors(device=device, batch=1, tokens=tokens, heads=heads,
+                                 dk=dk, dv=dv, seed=1, realistic_decay=True)
+                args = (t["q"], t["k"], t["v"], t["g"], t["b"], t["w"])
+                dmax = float((-t["g"].detach()).amax())
+                ce = max(1, min(chunk, int(160.0 / dmax))) if dmax > 0 else chunk
+                start = time.perf_counter()
+                out = compiled(*args, chunk=ce, chunk_eff=ce, solve="reference", neg_clamp=80.0)
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                compile_s = time.perf_counter() - start
+                ref_out = chunkwise_fused(*args, chunk=ce, chunk_eff=ce,
+                                          solve="reference", neg_clamp=80.0)
+                err = float((out.float() - ref_out.float()).abs().max())
+                timing = time_callable(
+                    lambda: compiled(*args, chunk=ce, chunk_eff=ce,
+                                     solve="reference", neg_clamp=80.0),
+                    warmup=2, reps=reps)
+                row[f"t{tokens}"] = dict(
+                    median_ms=timing["median_ms"], eager_ms=eager_times[f"t{tokens}"],
+                    speedup=eager_times[f"t{tokens}"] / timing["median_ms"],
+                    compile_s=compile_s, max_abs_vs_eager=err)
+            rows[mode] = row
+        except Exception as exc:  # noqa: BLE001
+            rows[mode] = dict(error=f"{type(exc).__name__}: {exc}")
+    return dict(ok=True, capabilities=caps, results=rows)
+
+
 def benchmark_stage_compare(*, tokens=8192, chunk=512, heads=10, dk=64, dv=64,
                             reps=5, device="cuda") -> dict:
     """把"参考实现 vs 融合实现"的差异定位到具体算子。
@@ -609,6 +707,10 @@ def run_probe(*, output: Path | str | None = None, tolerance=None,
                 tokens_list=(64, 2048), chunk=512)
             report["steps"]["widestep_correctness"] = compare_widestep_truth(
                 tokens=256, heads=10, dk=64, dv=64)
+            report["steps"]["torch_features"] = benchmark_torch_features(
+                tokens_list=(2048, 8192), chunk=86, reps=5)
+            report["steps"]["compiled_gradients"] = compare_compiled_gradients(
+                tokens=256, chunk=86, heads=10, dk=64, dv=64)
         except Exception as exc:  # noqa: BLE001
             report["blockers"].append(f"PyTorch batched 对照失败: {type(exc).__name__}: {exc}")
     report["feasible"] = (not report["blockers"]

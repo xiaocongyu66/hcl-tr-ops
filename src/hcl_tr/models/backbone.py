@@ -132,7 +132,8 @@ class GDN2Layer(nn.Module):
                  solve_mode: str = "solver", dt_min: float = 1e-3,
                  dt_max: float = 1e-1, a_log_min: float = 1.0,
                  a_log_max: float = 16.0, chunk_backend: str = "serial",
-                 fused_safe_exp: float = 80.0):
+                 fused_safe_exp: float = 80.0, compile_fused: bool = False,
+                 compile_chunk: int = 64):
         super().__init__()
         self.n_head = n_head
         self.head_dim = d_model // n_head
@@ -187,6 +188,8 @@ class GDN2Layer(nn.Module):
             raise NotImplementedError("fused GDN2 backend 暂不支持 QED/SLA")
         self.chunk_backend = chunk_backend
         self.fused_safe_exp = float(fused_safe_exp)
+        self.compile_fused = bool(compile_fused)
+        self.compile_chunk = int(compile_chunk)
         self.use_chunkwise = use_chunkwise
         # SLA 叠在 GDN-2 上（计划书 §9「在 +GDN/QED 上加 SLA」）：
         # G_Q/G_K 是 head 维 softmax 门控，乘在 l2norm 后的 q/k 上（论文 arXiv:2602.01744 §4.1）
@@ -276,12 +279,25 @@ class GDN2Layer(nn.Module):
                 chunk_eff = self.chunk if dmax <= 0 else max(1, min(self.chunk, int(safe / dmax)))
                 if self.chunk_override is not None:
                     chunk_eff = max(1, min(self.chunk, self.chunk_override))
+                if self.compile_fused:
+                    # 编译模式必须固定形状，否则 chunk_eff 每步变化会反复重编译。
+                    fixed = max(1, min(self.chunk, self.compile_chunk))
+                    limit = 2.0 * self.fused_safe_exp
+                    if dmax > 0 and fixed * dmax > limit:
+                        raise ValueError(
+                            f"compile_fused 固定 chunk={fixed} 不安全："
+                            f"chunk×dmax={fixed * dmax:.1f} > {limit:.1f}；"
+                            "请减小 gdn2_compile_chunk 或关闭编译")
+                    chunk_eff = fixed
                 if record is not None:
                     record.update(chunk_eff=chunk_eff, dmax=dmax)
             self._chunk_eff, self._last_dmax = chunk_eff, dmax
             if self.chunk_backend == "fused":
-                from .gdn2_chunk_opt import chunkwise_fused
-                o = chunkwise_fused(
+                if self.compile_fused:
+                    from .gdn2_chunk_opt import chunkwise_fused_compiled as fused_fn
+                else:
+                    from .gdn2_chunk_opt import chunkwise_fused as fused_fn
+                o = fused_fn(
                     q, k, v, g, b, w, chunk=self.chunk, neg_clamp=self.fused_safe_exp,
                     divide_by_sqrt_t=self.divide_by_sqrt_t, l2norm_qk=True,
                     matmul_dtype=self.matmul_dtype, chunk_eff=self._chunk_eff,
@@ -386,6 +402,8 @@ class HybridBackbone(nn.Module):
         gdn2_a_log_max: float = 16.0,
         gdn2_chunk_backend: str = "serial",
         gdn2_fused_safe_exp: float = 80.0,     # 仅 fused：chunk×dmax 上限，同步放宽 clamp
+        gdn2_compile_fused: bool = False,      # 用 torch.compile 编译融合算子（需固定 chunk）
+        gdn2_compile_chunk: int = 64,          # 编译模式下固定的 chunk（避免反复重编译）
         gdn2_chunk: int = 64,                  # chunkwise GDN-2 的块大小
         use_chunkwise: bool = True,            # 逐 token 循环太慢，默认用 chunkwise
     ):
@@ -423,6 +441,8 @@ class HybridBackbone(nn.Module):
                     a_log_min=gdn2_a_log_min, a_log_max=gdn2_a_log_max,
                     chunk_backend=gdn2_chunk_backend,
                     fused_safe_exp=gdn2_fused_safe_exp,
+                    compile_fused=gdn2_compile_fused,
+                    compile_chunk=gdn2_compile_chunk,
                 ))
         self.blocks = nn.ModuleList(blocks)
         self.norm_f = RMSNorm(d_model)
