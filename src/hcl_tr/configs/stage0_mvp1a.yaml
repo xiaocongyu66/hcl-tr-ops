@@ -18,7 +18,8 @@ model:
   # chunk 越大单次 GEMM 越高效，但指数可表示范围随 chunk 收缩，
   # 运行时仍会按 dmax 做安全 chunk 校准（backbone.py）。
   gdn2_chunk: 512
-  gdn2_chunk_backend: batched
+  gdn2_chunk_backend: fused          # A/P 单次 GEMM + UT 变换 + 放宽 clamp 的大 chunk
+  gdn2_fused_safe_exp: 80.0          # chunk×dmax 上限；与 exp(-G) 的 clamp 同步放宽
   gdn2_matmul_dtype: fp32
 
 # 训练种子（所有归因组必须相同）

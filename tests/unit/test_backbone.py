@@ -273,6 +273,21 @@ def test_nonfinite_decay_fails_instead_of_reusing_cache():
         layer(torch.zeros(1, 4, 16))
 
 
+def test_fused_widestep_matches_serial_backend():
+    """fused 用更大 chunk（safe_exp=80）时，仍应与 serial 数值一致。"""
+    from hcl_tr.models.backbone import GDN2Layer
+    torch.manual_seed(31)
+    serial = GDN2Layer(16, 2, chunk=64, chunk_backend="serial")
+    fused = GDN2Layer(16, 2, chunk=64, chunk_backend="fused")
+    fused.load_state_dict(serial.state_dict())
+    x = torch.randn(1, 96, 16)
+    with torch.no_grad():
+        expected = serial(x)["out"]
+        actual = fused(x)["out"]
+    assert fused._chunk_eff >= serial._chunk_eff
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+
 def test_fused_backend_rejects_unsupported_options():
     import pytest
     with pytest.raises(ValueError, match="只支持 fp32"):

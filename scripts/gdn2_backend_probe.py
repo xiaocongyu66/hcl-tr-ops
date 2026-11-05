@@ -374,6 +374,48 @@ def compare_fused_gpu(*, tokens_list=(64, 2048), chunk=512, heads=10, dk=64, dv=
                 tolerance_abs=5e-4)
 
 
+def compare_widestep_truth(*, tokens=256, heads=10, dk=64, dv=64, device="cuda") -> dict:
+    """放大 chunk + 放宽 clamp 后，直接对 fp64 逐 token 真值校验。"""
+    if device == "cuda" and not torch.cuda.is_available():
+        return dict(ok=False, error="需要 CUDA")
+    from hcl_tr.models.gdn2_chunk_opt import chunkwise_fused
+    t = make_tensors(device=device, batch=1, tokens=tokens, heads=heads, dk=dk, dv=dv,
+                     seed=11, realistic_decay=True)
+    args = (t["q"], t["k"], t["v"], t["g"], t["b"], t["w"])
+    truth = reference_recurrence(*args)
+    dmax = float((-t["g"].detach()).amax())
+    rows = {}
+    for chunk in (21, 43, 86):
+        out = chunkwise_fused(*args, chunk=chunk, chunk_eff=chunk, solve="reference",
+                              neg_clamp=80.0)
+        diff = (out.double() - truth).abs()
+        rows[f"chunk{chunk}"] = dict(max_abs=float(diff.max()),
+                                     mean_abs=float(diff.mean()),
+                                     finite=bool(torch.isfinite(out).all()))
+    # 最大 chunk 的梯度与既有批量实现对照（前向已对 fp64 真值校验）。
+    from hcl_tr.models.gdn2_ref import gdn2_chunkwise_batched_forward
+    ref_inputs = [x.detach().requires_grad_(True) for x in args]
+    fused_inputs = [x.detach().requires_grad_(True) for x in args]
+    # 对照组必须用它自己准确的 chunk：reference 的 clamp 固定 -40，
+    # 在 chunk=86 时其前向本身就不可信（实测误差 ~1e-1）。
+    ref_chunk = max(1, min(chunk, int(40.0 / dmax))) if dmax > 0 else chunk
+    ref = gdn2_chunkwise_batched_forward(*ref_inputs, chunk=ref_chunk,
+                                          chunk_eff_in=ref_chunk,
+                                          divide_by_sqrt_t=True, l2norm_qk=True)
+    fused = chunkwise_fused(*fused_inputs, chunk=chunk, chunk_eff=chunk,
+                            solve="reference", neg_clamp=80.0)
+    weight = torch.randn_like(ref)
+    (ref * weight).sum().backward()
+    (fused * weight).sum().backward()
+    grad_err = [float((a.grad - b.grad).abs().max()) for a, b in zip(fused_inputs, ref_inputs)]
+    grad_ok = all(bool(torch.isfinite(a.grad).all()) and e <= 1e-4
+                  for a, e in zip(fused_inputs, grad_err))
+    ok = (all(v["finite"] and v["max_abs"] <= 1e-5 for v in rows.values()) and grad_ok)
+    return dict(ok=ok, tokens=tokens, dmax=dmax, clamp=-80.0, rows=rows,
+                grad_chunk=chunk, grad_max_abs=max(grad_err),
+                grad_each_max_abs=grad_err, grad_ok=grad_ok, tolerance_abs=1e-5)
+
+
 def benchmark_stage_compare(*, tokens=8192, chunk=512, heads=10, dk=64, dv=64,
                             reps=5, device="cuda") -> dict:
     """把"参考实现 vs 融合实现"的差异定位到具体算子。
@@ -444,17 +486,6 @@ def benchmark_chunk_variants(*, tokens_list=(2048, 8192), chunk=512, heads=10, d
     from hcl_tr.models.gdn2_ref import gdn2_chunkwise_batched_forward
     from hcl_tr.models.gdn2_chunk_opt import chunkwise_fused
 
-    variants = {
-        "reference": lambda a, c, ce: gdn2_chunkwise_batched_forward(
-            *a, chunk=c, chunk_eff_in=ce, divide_by_sqrt_t=True, l2norm_qk=True),
-        "fused_solve": lambda a, c, ce: chunkwise_fused(
-            *a, chunk=c, chunk_eff=ce, solve="reference"),
-        "fused_blocked64": lambda a, c, ce: chunkwise_fused(
-            *a, chunk=c, chunk_eff=ce, solve="blocked", block=64),
-        "fused_blocked128": lambda a, c, ce: chunkwise_fused(
-            *a, chunk=c, chunk_eff=ce, solve="blocked", block=128),
-    }
-
     if device == "cuda":
         _warm_clocks()
 
@@ -465,6 +496,21 @@ def benchmark_chunk_variants(*, tokens_list=(2048, 8192), chunk=512, heads=10, d
         args = (t["q"], t["k"], t["v"], t["g"], t["b"], t["w"])
         dmax = float((-t["g"].detach()).amax())
         chunk_eff = max(1, min(chunk, int(40.0 / dmax))) if dmax > 0 else chunk
+        # 中点平移后单因子幅度上界是 e^{chunk×dmax/2}，故上限为 160/dmax。
+        wide_eff = max(1, min(86, int(160.0 / dmax))) if dmax > 0 else 86
+        variants = {
+            "reference": lambda a, c, ce: gdn2_chunkwise_batched_forward(
+                *a, chunk=c, chunk_eff_in=ce, divide_by_sqrt_t=True, l2norm_qk=True),
+            "fused_solve": lambda a, c, ce: chunkwise_fused(
+                *a, chunk=c, chunk_eff=ce, solve="reference"),
+            "fused_blocked64": lambda a, c, ce: chunkwise_fused(
+                *a, chunk=c, chunk_eff=ce, solve="blocked", block=64),
+            "fused_blocked128": lambda a, c, ce: chunkwise_fused(
+                *a, chunk=c, chunk_eff=ce, solve="blocked", block=128),
+            "fused_widestep": lambda a, c, ce: chunkwise_fused(
+                *a, chunk=wide_eff, chunk_eff=wide_eff, solve="reference",
+                neg_clamp=80.0),
+        }
         row = {}
         # 正反两轮：若某变体只在"第一个跑"时慢，说明是时钟爬升而不是实现差异。
         for pass_name, order in (("forward", list(variants)),
@@ -488,7 +534,8 @@ def benchmark_chunk_variants(*, tokens_list=(2048, 8192), chunk=512, heads=10, d
                 if len(passes) == 2:
                     value["order_effect"] = max(passes.values()) / min(passes.values())
         results[f"t{tokens}_c{chunk}"] = dict(
-            requested_chunk=chunk, effective_chunk=chunk_eff, dmax=dmax, variants=row)
+            requested_chunk=chunk, effective_chunk=chunk_eff, wide_chunk=wide_eff,
+            dmax=dmax, variants=row)
     return dict(ok=True, requested_chunk=chunk, heads=heads, dk=dk, dv=dv,
                 realistic_decay=True, reps=reps,
                 order_control="forward+reverse, median_ms=两轮较小值", results=results)
@@ -560,6 +607,8 @@ def run_probe(*, output: Path | str | None = None, tolerance=None,
                 tokens=8192, chunk=512, reps=5)
             report["steps"]["fused_correctness"] = compare_fused_gpu(
                 tokens_list=(64, 2048), chunk=512)
+            report["steps"]["widestep_correctness"] = compare_widestep_truth(
+                tokens=256, heads=10, dk=64, dv=64)
         except Exception as exc:  # noqa: BLE001
             report["blockers"].append(f"PyTorch batched 对照失败: {type(exc).__name__}: {exc}")
     report["feasible"] = (not report["blockers"]

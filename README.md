@@ -13,12 +13,18 @@ Hybrid CMM-Linear with Learned Rethink Triggering —— **混合骨干（3:1 GD
 | 项目 | 结果 |
 |---|---|
 | GDN-2 chunkwise 与独立 fp64 实现的最大误差 | `1.55e-07` |
-| 生产配置（B=1,H=10,dk=dv=64,chunk=512）2K / 8K 单次前向 | 17.4 ms / 73.1 ms（CUDA event） |
-| 8K 阶段分解 | 构造 A/P 10.1 ms、三角求解 7.3 ms、跨块递推 5.6 ms、预处理 3.0 ms |
+| 现有批量实现（B=1,H=10,dk=dv=64）2K / 8K 单次前向 | 20.5 ms / 105.0 ms（CUDA event） |
+| 融合后端（中点平移，chunk=86）2K / 8K | 5.6 ms / 19.1 ms（**3.6× / 5.6×**） |
+| 融合后端对 fp64 真值误差（chunk 21/43/86） | `7.6e-08` / `1.3e-07` / `2.1e-07` |
+| 融合后端梯度对准确基准的最大误差 | `7.2e-07`（chunk 86，全部输入） |
 | 融合 RoPE（Triton）数值 | 输出与输入梯度均通过（fp32 容差 1e-5，fp16 容差 5e-3） |
 | 融合 RoPE 端到端收益 | **没有**：2K AMP 12.35 ms vs torch 6.28 ms |
 | TileLang 0.1.15 在 SM75 | 编译并运行成功 |
 | FlashQLA | **不支持 T4**：仅 sm90/100/103/120/121 |
+
+融合后端的三处关键改动：A/P 合并为一次 GEMM；UT 变换把递推循环中每 chunk 的
+GEMM 从 4 个降到 3 个；按块内中点平移指数因子，使 `exp(±(G−c))` 的幅度上界从
+`e^{chunk×dmax}` 降到 `e^{chunk×dmax/2}`，把安全 chunk 从 21 提到 86。
 
 上述"没有收益"和"不支持"都是实测结论，仓库不把它们包装成优点。
 

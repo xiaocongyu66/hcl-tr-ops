@@ -20,7 +20,8 @@ def test_stage0_config_maps_to_accepted_model_kwargs():
     accepted = set(inspect.signature(HybridBackbone.__init__).parameters) - {'self'}
     assert set(kwargs) <= accepted
     assert kwargs['gdn2_chunk'] == 512
-    assert kwargs['gdn2_chunk_backend'] == 'batched'
+    assert kwargs['gdn2_chunk_backend'] == 'fused'
+    assert kwargs['gdn2_fused_safe_exp'] == 80.0
 
 
 def test_unknown_model_key_is_rejected():

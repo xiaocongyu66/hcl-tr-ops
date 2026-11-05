@@ -77,7 +77,7 @@ def chunkwise_fused(
     q, k, v, g, b, w, *, chunk: int = 512, divide_by_sqrt_t: bool = True,
     l2norm_qk: bool = True, solve: str = "blocked", block: int = 64,
     matmul_dtype: torch.dtype = torch.float32, chunk_eff: int | None = None,
-    chunk_override: int | None = None,
+    chunk_override: int | None = None, neg_clamp: float = 40.0,
 ):
     """等价于 gdn2_ref.gdn2_chunkwise_batched_forward 的融合实现。
 
@@ -109,13 +109,23 @@ def chunkwise_fused(
     Q, K, V, Gm, Bm, W = (_window(x, n, chunk, heads, pad) for x in (qf, kf, vf, gf, bf, wf))
     cum = Gm.cumsum(dim=-2)
     exp_cum = cum.exp()
-    decay_inv = torch.exp(-cum.clamp(min=-40.0))
-    bk_e = (Bm * K) * exp_cum
-    q_e = Q * exp_cum
-    k_ei = K * decay_inv
+
+    # 中点平移：A/P 只依赖 exp(G_t-G_s)，与参考点 c 无关。
+    # 取 c = (G_max+G_min)/2 后，两个因子的最大幅度从 e^{R} 降到 e^{R/2}
+    # （R = chunk×dmax），同等 fp32 余量下可用 chunk 上限约翻倍。
+    mid = 0.5 * (cum.amax(dim=-2, keepdim=True) + cum.amin(dim=-2, keepdim=True))
+    shift = (cum - mid).clamp(min=-neg_clamp, max=neg_clamp)
+    exp_pos = shift.exp()
+    exp_neg = (-shift).exp()
+
+    bk_e = (Bm * K) * exp_cum          # rhs 用真实尺度：exp(G) ≤ 1，不会溢出
+    q_e = Q * exp_cum                  # 状态项同样保持真实尺度
+    bk_e_s = (Bm * K) * exp_pos
+    q_e_s = Q * exp_pos
+    k_ei_s = K * exp_neg
 
     # 一次 GEMM 同时产出 A 与 P：上行 Bk_e 给 A，下行 Q_e 给 P。
-    both = torch.cat((bk_e, q_e), dim=-2) @ k_ei.transpose(-1, -2)
+    both = torch.cat((bk_e_s, q_e_s), dim=-2) @ k_ei_s.transpose(-1, -2)
     a = both[..., :chunk, :].masked_fill(~mask_lt, 0.0).to(torch.float32)
     p = both[..., chunk:, :].masked_fill(~mask_le, 0.0)
 
@@ -135,6 +145,12 @@ def chunkwise_fused(
     px0, px1 = both_out[..., :dv], both_out[..., dv:]
     qeff = q_e - px1
 
+    # 循环内只做 GEMM：把逐 chunk 的指数与衰减提到循环外批量算。
+    # K_last = K·exp(G_last - G_s) ≤ K，指数恒非正，不需要巨大中间因子。
+    cum_last = cum[..., -1:, :]
+    k_last_all = K * torch.exp((cum_last - cum).clamp(min=-neg_clamp))
+    decay_all = exp_cum[..., -1, :]
+
     md = matmul_dtype
     state = torch.zeros(batch, heads, dk, dv, device=dev, dtype=torch.float32)
     outs = []
@@ -142,9 +158,9 @@ def chunkwise_fused(
         s_m = state.to(md)
         x = (x0[:, i] - x1[:, i] @ s_m.float()).to(md)
         outs.append((px0[:, i] + qeff[:, i] @ s_m).permute(0, 2, 1, 3))
-        decay = exp_cum[:, i, :, -1]
-        k_last = decay.unsqueeze(-2) * k_ei[:, i]
-        state = decay.unsqueeze(-1).float() * state + (k_last.transpose(-1, -2) @ x).float()
+        decay = decay_all[:, i]
+        state = decay.unsqueeze(-1).float() * state + (
+            k_last_all[:, i].transpose(-1, -2) @ x).float()
 
     o = torch.cat(outs, dim=1)[:, :tokens].float()
     if divide_by_sqrt_t:
