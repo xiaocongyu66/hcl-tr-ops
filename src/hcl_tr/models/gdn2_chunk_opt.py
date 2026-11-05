@@ -18,6 +18,29 @@ import torch
 
 __all__ = ["chunkwise_fused"]
 
+_MASK_CACHE: dict = {}
+_DENOM_CACHE: dict = {}
+
+
+def _masks(chunk: int, device):
+    key = (chunk, str(device))
+    cached = _MASK_CACHE.get(key)
+    if cached is None:
+        base = torch.ones(chunk, chunk, device=device, dtype=torch.bool)
+        cached = (base.tril(-1), base.tril())
+        _MASK_CACHE[key] = cached
+    return cached
+
+
+def _inv_sqrt_t(tokens: int, device):
+    key = (tokens, str(device))
+    cached = _DENOM_CACHE.get(key)
+    if cached is None:
+        cached = torch.sqrt(torch.arange(1, tokens + 1, device=device,
+                                         dtype=torch.float32)).view(1, tokens, 1, 1)
+        _DENOM_CACHE[key] = cached
+    return cached
+
 
 def _l2norm(x: torch.Tensor) -> torch.Tensor:
     return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -81,8 +104,7 @@ def chunkwise_fused(
     chunk = int(chunk_eff)
     n = (tokens + chunk - 1) // chunk
     pad = n * chunk - tokens
-    mask_lt = torch.ones(chunk, chunk, device=dev, dtype=torch.bool).tril(-1)
-    mask_le = torch.ones(chunk, chunk, device=dev, dtype=torch.bool).tril()
+    mask_lt, mask_le = _masks(chunk, dev)
 
     Q, K, V, Gm, Bm, W = (_window(x, n, chunk, heads, pad) for x in (qf, kf, vf, gf, bf, wf))
     cum = Gm.cumsum(dim=-2)
@@ -106,20 +128,25 @@ def chunkwise_fused(
         x_all = torch.linalg.solve_triangular(lin, rhs, upper=False)
     x0, x1 = x_all[..., :dv], x_all[..., dv:]
 
+    # UT 变换：out = Q_e@S + P@(X0 - X1@S) = P@X0 + (Q_e - P@X1)@S。
+    # 两项都与状态无关，循环外各用一次批量 GEMM 算完；循环内每 chunk
+    # 从 4 个 GEMM 降到 3 个。
+    both_out = p @ torch.cat((x0, x1), dim=-1)   # 一次 GEMM 同时算 P@X0 与 P@X1
+    px0, px1 = both_out[..., :dv], both_out[..., dv:]
+    qeff = q_e - px1
+
     md = matmul_dtype
     state = torch.zeros(batch, heads, dk, dv, device=dev, dtype=torch.float32)
     outs = []
     for i in range(n):
         s_m = state.to(md)
         x = (x0[:, i] - x1[:, i] @ s_m.float()).to(md)
-        outs.append((q_e[:, i] @ s_m + p[:, i] @ x).permute(0, 2, 1, 3))
+        outs.append((px0[:, i] + qeff[:, i] @ s_m).permute(0, 2, 1, 3))
         decay = exp_cum[:, i, :, -1]
         k_last = decay.unsqueeze(-2) * k_ei[:, i]
         state = decay.unsqueeze(-1).float() * state + (k_last.transpose(-1, -2) @ x).float()
 
     o = torch.cat(outs, dim=1)[:, :tokens].float()
     if divide_by_sqrt_t:
-        denom = torch.sqrt(torch.arange(1, tokens + 1, device=dev,
-                                        dtype=torch.float32)).view(1, tokens, 1, 1)
-        o = o / denom
+        o = o / _inv_sqrt_t(tokens, dev)
     return o
