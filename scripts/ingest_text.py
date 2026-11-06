@@ -104,18 +104,22 @@ def build_shards(docs: list[str], tokenizer_path: str, out_dir: str,
         raise ValueError(f"词表 {vocab_size} 超出 uint16 上限 65535")
 
     out = Path(out_dir)
-    shard_idx, buffer, written = 0, [], 0
-    for enc in tok.encode_batch(docs, add_special_tokens=False):
-        buffer.append(np.asarray(enc.ids, dtype=np.uint16))
-        buffer.append(np.asarray([eos_id], dtype=np.uint16))
-        if sum(len(b) for b in buffer) >= shard_tokens:
-            tokens = np.concatenate(buffer)
-            write_shard(out, shard_idx, tokens)
-            written += len(tokens)
-            shard_idx += 1
-            buffer = []
-    if buffer:
-        tokens = np.concatenate(buffer)
+    shard_idx, buffered, written = 0, 0, 0
+    pending = []
+    # 分块编码：整语料一次 encode_batch 在亿级 token 下会撑爆内存。
+    for start in range(0, len(docs), 4096):
+        for enc in tok.encode_batch(docs[start:start + 4096], add_special_tokens=False):
+            pending.append(np.asarray(enc.ids, dtype=np.uint16))
+            pending.append(np.asarray([eos_id], dtype=np.uint16))
+            buffered += len(enc.ids) + 1
+            if buffered >= shard_tokens:
+                tokens = np.concatenate(pending)
+                write_shard(out, shard_idx, tokens)
+                written += len(tokens)
+                shard_idx += 1
+                buffered, pending = 0, []
+    if pending:
+        tokens = np.concatenate(pending)
         write_shard(out, shard_idx, tokens)
         written += len(tokens)
         shard_idx += 1
