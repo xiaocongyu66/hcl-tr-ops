@@ -29,9 +29,9 @@ except Exception:  # noqa: BLE001
 if HAS_TRITON:
 
     @triton.jit
-    def _recur_kernel(X0, X1, KL, PX0, QEFF, DEC, O,
+    def _recur_kernel(X0, X1, KL, PX0, QEFF, DEC, O, S_SAVED,
                       N, C: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
-                      DV_T: tl.constexpr):
+                      DV_T: tl.constexpr, SAVE: tl.constexpr):
         bh = tl.program_id(0)
         dt = tl.program_id(1)
         offs_c = tl.arange(0, C)
@@ -40,9 +40,13 @@ if HAS_TRITON:
 
         base_v = bh * N * C * DV
         base_k = bh * N * C * DK
+        base_s = bh * N * DK * DV
 
         s = tl.zeros((DK, DV_T), dtype=tl.float32)
         for i in tl.range(0, N):
+            if SAVE:
+                tl.store(S_SAVED + base_s + i * DK * DV
+                         + offs_k[:, None] * DV + offs_v[None, :], s)
             q = tl.load(QEFF + base_k + i * C * DK
                         + offs_c[:, None] * DK + offs_k[None, :])
             px = tl.load(PX0 + base_v + i * C * DV
@@ -61,6 +65,61 @@ if HAS_TRITON:
             dec = tl.load(DEC + (bh * N + i) * DK + offs_k)
             s = dec[:, None] * s + tl.dot(tl.trans(kl), x, input_precision="ieee")
 
+    @triton.jit
+    def _recur_bwd_kernel(X0, X1, KL, QEFF, DEC, S_SAVED, DO,
+                          DX0, DX1, DKL, DQEFF, DDEC,
+                          N, C: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
+                          DV_T: tl.constexpr, NT: tl.constexpr):
+        bh = tl.program_id(0)
+        dt = tl.program_id(1)
+        offs_c = tl.arange(0, C)
+        offs_k = tl.arange(0, DK)
+        offs_v = dt * DV_T + tl.arange(0, DV_T)
+
+        base_v = bh * N * C * DV
+        base_k = bh * N * C * DK
+        base_s = bh * N * DK * DV
+
+        ds = tl.zeros((DK, DV_T), dtype=tl.float32)
+        for j in tl.range(0, N):
+            i = N - 1 - j
+            do = tl.load(DO + base_v + i * C * DV
+                         + offs_c[:, None] * DV + offs_v[None, :])
+            s = tl.load(S_SAVED + base_s + i * DK * DV
+                        + offs_k[:, None] * DV + offs_v[None, :])
+            q = tl.load(QEFF + base_k + i * C * DK
+                        + offs_c[:, None] * DK + offs_k[None, :])
+            # 这三个梯度要对整个 dv 求和，每个 dv tile 只能贡献部分和，
+            # 因此写到 tile 独立槽位，由调用方求和（直接写会互相覆盖）。
+            tl.store(DQEFF + ((bh * N + i) * NT + dt) * C * DK
+                     + offs_c[:, None] * DK + offs_k[None, :],
+                     tl.dot(do, tl.trans(s), input_precision="ieee"))
+
+            x0 = tl.load(X0 + base_v + i * C * DV
+                         + offs_c[:, None] * DV + offs_v[None, :])
+            x1 = tl.load(X1 + base_k + i * C * DK
+                         + offs_c[:, None] * DK + offs_k[None, :])
+            x = x0 - tl.dot(x1, s, input_precision="ieee")
+            tl.store(DKL + ((bh * N + i) * NT + dt) * C * DK
+                     + offs_c[:, None] * DK + offs_k[None, :],
+                     tl.dot(x, tl.trans(ds), input_precision="ieee"))
+            tl.store(DDEC + ((bh * N + i) * NT + dt) * DK + offs_k,
+                     tl.sum(ds * s, axis=1))
+
+            kl = tl.load(KL + base_k + i * C * DK
+                         + offs_c[:, None] * DK + offs_k[None, :])
+            dx = tl.dot(kl, ds, input_precision="ieee")
+            tl.store(DX0 + base_v + i * C * DV
+                     + offs_c[:, None] * DV + offs_v[None, :], dx)
+            tl.store(DX1 + ((bh * N + i) * NT + dt) * C * DK
+                     + offs_c[:, None] * DK + offs_k[None, :],
+                     -tl.dot(dx, tl.trans(s), input_precision="ieee"))
+
+            dec = tl.load(DEC + (bh * N + i) * DK + offs_k)
+            ds = (dec[:, None] * ds
+                  - tl.dot(tl.trans(x1), dx, input_precision="ieee")
+                  + tl.dot(tl.trans(q), do, input_precision="ieee"))
+
 
 def recurrence_eager(px0, qeff, x0, x1, kl, dec):
     """与 kernel 等价；用于反向重算与 CPU 测试。"""
@@ -76,7 +135,7 @@ def recurrence_eager(px0, qeff, x0, x1, kl, dec):
 
 
 def recurrence_triton(x0, x1, kl, px0, qeff, dec, dv_tile: int = 32,
-                      num_warps: int = 8):
+                      num_warps: int = 8, states=None):
     if not HAS_TRITON:
         raise RuntimeError("triton 不可用")
     if px0.device.type != "cuda":
@@ -90,27 +149,59 @@ def recurrence_triton(x0, x1, kl, px0, qeff, dec, dv_tile: int = 32,
     out = torch.empty_like(px0)
     dv_tile = max(16, min(dv_tile, dv))
     grid = (bh, triton.cdiv(dv, dv_tile))
-    _recur_kernel[grid](x0, x1, kl, px0, qeff, dec, out, n, chunk, dk, dv, dv_tile,
+    save = states is not None
+    _recur_kernel[grid](x0, x1, kl, px0, qeff, dec, out,
+                        states if save else px0, n, chunk, dk, dv, dv_tile, save,
                         num_warps=num_warps)
     return out
 
 
+def recurrence_triton_backward(do, x0, x1, kl, qeff, dec, states,
+                               dv_tile: int = 32, num_warps: int = 8):
+    """反向：基于前向保存的 S_i 逆序递推，一次 kernel 出全部梯度。"""
+    for name, t in (("x0", x0), ("x1", x1), ("kl", kl), ("qeff", qeff),
+                    ("dec", dec), ("states", states)):
+        if not t.is_contiguous():
+            raise ValueError(f"recurrence_triton_backward 需要连续张量：{name} 非连续")
+    bh, n, chunk, dk = qeff.shape
+    dv = x0.shape[-1]
+    dv_tile = max(16, min(dv_tile, dv))
+    nt = triton.cdiv(dv, dv_tile)
+    do = do.contiguous()
+    dx0 = torch.empty_like(x0)
+    # 跨 dv 求和的三个梯度按 tile 分槽存放，最后求和。
+    part = (bh, n, nt, chunk, dk)
+    dx1_t = torch.empty(part, device=x0.device, dtype=torch.float32)
+    dkl_t = torch.empty(part, device=x0.device, dtype=torch.float32)
+    dqeff_t = torch.empty(part, device=x0.device, dtype=torch.float32)
+    ddec_t = torch.empty(bh, n, nt, dk, device=x0.device, dtype=torch.float32)
+    _recur_bwd_kernel[(bh, nt)](
+        x0, x1, kl, qeff, dec, states, do,
+        dx0, dx1_t, dkl_t, dqeff_t, ddec_t,
+        n, chunk, dk, dv, dv_tile, nt, num_warps=num_warps)
+    return (dx0, dx1_t.sum(dim=2), dkl_t.sum(dim=2), dqeff_t.sum(dim=2),
+            ddec_t.sum(dim=2))
+
+
 class _TritonRecurrence(torch.autograd.Function):
-    """前向走融合 kernel；反向用等价 eager 实现重算（一阶正确）。"""
+    """前向与反向都走融合 kernel；反向使用前向保存的逐 chunk 状态。"""
 
     @staticmethod
     def forward(ctx, x0, x1, kl, px0, qeff, dec):
-        ctx.save_for_backward(x0, x1, kl, px0, qeff, dec)
-        return recurrence_triton(x0, x1, kl, px0, qeff, dec)
+        bh, n, chunk, dk = qeff.shape
+        dv = px0.shape[-1]
+        states = torch.empty(bh, n, dk, dv, device=px0.device, dtype=torch.float32)
+        out = recurrence_triton(x0, x1, kl, px0, qeff, dec, states=states)
+        ctx.save_for_backward(x0, x1, kl, qeff, dec, states)
+        return out
 
     @staticmethod
     def backward(ctx, grad_out):
-        x0, x1, kl, px0, qeff, dec = (t.detach().requires_grad_(True)
-                                      for t in ctx.saved_tensors)
-        with torch.enable_grad():
-            out = recurrence_eager(px0, qeff, x0, x1, kl, dec)
-            grads = torch.autograd.grad(out, (x0, x1, kl, px0, qeff, dec), grad_out)
-        return tuple(grads)
+        x0, x1, kl, qeff, dec, states = ctx.saved_tensors
+        dx0, dx1, dkl, dqeff, ddec = recurrence_triton_backward(
+            grad_out, x0, x1, kl, qeff, dec, states)
+        # d(px0) = dO（逐元素恒等），无需 kernel 写回。
+        return dx0, dx1, dkl, grad_out, dqeff, ddec
 
 
 def recurrence(x0, x1, kl, px0, qeff, dec):

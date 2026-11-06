@@ -604,6 +604,112 @@ def compare_triton_loop(*, tokens=512, chunk=64, heads=10, dk=64, dv=64,
                 grad_each_max_abs=grads, grad_max_abs=max(grads), **stats)
 
 
+def check_kernel_backward(*, bh=2, n=4, c=64, dk=64, dv=64, device="cuda") -> dict:
+    """单独校验递推 kernel 的反向：与 eager autograd 的六个输入梯度逐一对比。"""
+    if device == "cuda" and not torch.cuda.is_available():
+        return dict(ok=False, error="需要 CUDA")
+    from hcl_tr.models.gdn2_recur_triton import (HAS_TRITON, recurrence_eager,
+                                                 recurrence_triton,
+                                                 recurrence_triton_backward)
+    if not HAS_TRITON:
+        return dict(ok=False, error="triton 不可用")
+    g = torch.Generator(device=device).manual_seed(11)
+    x0 = torch.randn(bh, n, c, dv, generator=g, device=device)
+    x1 = torch.randn(bh, n, c, dk, generator=g, device=device) * 0.1
+    kl = torch.rand(bh, n, c, dk, generator=g, device=device)
+    px0 = torch.randn(bh, n, c, dv, generator=g, device=device)
+    qeff = torch.randn(bh, n, c, dk, generator=g, device=device) * 0.1
+    dec = torch.rand(bh, n, dk, generator=g, device=device)
+    weight = torch.randn(bh, n, c, dv, generator=g, device=device)
+
+    leaves = [t.clone().requires_grad_(True) for t in (x0, x1, kl, px0, qeff, dec)]
+    out = recurrence_eager(leaves[3], leaves[4], leaves[0], leaves[1],
+                           leaves[2], leaves[5])
+    out.backward(weight)
+    ref = [t.grad for t in leaves]
+
+    # 诊断 1：前向保存的状态是否与 eager 一致
+    s = torch.zeros(bh, dk, dv, device=device)
+    s_list = []
+    for i in range(n):
+        s_list.append(s.clone())
+        x = x0[:, i] - x1[:, i] @ s
+        s = dec[:, i].unsqueeze(-1) * s + kl[:, i].transpose(-1, -2) @ x
+    states_ref = torch.stack(s_list, dim=1)
+    states = torch.empty(bh, n, dk, dv, device=device)
+    recurrence_triton(x0, x1, kl, px0, qeff, dec, states=states)
+    states_err = float((states - states_ref).abs().max())
+
+    # 诊断 2：tl.dot(a, tl.trans(b)) 是否与 torch 一致
+    import triton as _tl
+    import triton.language as _tll
+
+    @_tl.jit
+    def _trans_probe(A, B, C_, M: _tll.constexpr, N: _tll.constexpr, K: _tll.constexpr):
+        a = _tll.load(A + _tll.arange(0, M)[:, None] * K + _tll.arange(0, K)[None, :])
+        b = _tll.load(B + _tll.arange(0, N)[:, None] * K + _tll.arange(0, K)[None, :])
+        c = _tll.dot(a, _tll.trans(b), input_precision="ieee")
+        _tll.store(C_ + _tll.arange(0, M)[:, None] * N + _tll.arange(0, N)[None, :], c)
+
+    M = N = K = 64
+    ga = torch.randn(M, K, device=device)
+    gb = torch.randn(N, K, device=device)
+    gc = torch.empty(M, N, device=device)
+    _trans_probe[(1,)](ga, gb, gc, M, N, K, num_warps=8)
+    trans_err = float((gc - ga @ gb.T).abs().max())
+    dx0, dx1, dkl, dqeff, ddec = recurrence_triton_backward(
+        weight, x0, x1, kl, qeff, dec, states)
+    # d(px0) = dO，kernel 不写回，这里直接补上以对齐六个输入。
+    tri = (dx0, dx1, dkl, weight, dqeff, ddec)
+    diffs = [float((a - b).abs().max()) for a, b in zip(tri, ref)]
+    names = ["x0", "x1", "kl", "px0", "qeff", "dec"]
+    # 用相对误差判断：量级可达 1e3，绝对容差不适用。
+    rel = [d / max(float(r.abs().max()), 1e-12) for d, r in zip(diffs, ref)]
+    worst = max(rel)
+    return dict(ok=worst <= 1e-5, diffs=dict(zip(names, diffs)),
+                rel=dict(zip(names, rel)),
+                ref_absmax=[float(r.abs().max()) for r in ref],
+                states_err=states_err, trans_err=trans_err)
+
+
+def benchmark_triton_train_step(*, tokens_list=(2048, 8192), chunk=86, heads=10,
+                                dk=64, dv=64, reps=3, device="cuda") -> dict:
+    """前向+反向整体计时：eager 循环 vs Triton 前向+反向 kernel。"""
+    if device == "cuda" and not torch.cuda.is_available():
+        return dict(ok=False, error="需要 CUDA")
+    from hcl_tr.models.gdn2_chunk_opt import chunkwise_fused
+    try:
+        from hcl_tr.models.gdn2_recur_triton import HAS_TRITON
+    except Exception:  # noqa: BLE001
+        HAS_TRITON = False
+    if not HAS_TRITON:
+        return dict(ok=False, error="triton 不可用")
+
+    _warm_clocks()
+    rows = {}
+    for tokens in tokens_list:
+        t = make_tensors(device=device, batch=1, tokens=tokens, heads=heads, dk=dk, dv=dv,
+                         seed=2, realistic_decay=True)
+        args = [t[k].detach().requires_grad_(True) for k in ("q", "k", "v", "g", "b", "w")]
+        weight = torch.randn(1, tokens, heads, dv, device=device)
+        base = dict(chunk=chunk, chunk_eff=chunk, solve="reference", neg_clamp=80.0)
+
+        def step(backend):
+            for a in args:
+                a.grad = None
+            out = chunkwise_fused(*args, loop_backend=backend, **base)
+            (out * weight).sum().backward()
+
+        entry = {}
+        for backend in ("eager", "triton"):
+            step(backend)  # 预热（含 Triton JIT 编译）
+            entry[backend] = time_callable(lambda b=backend: step(b), warmup=1,
+                                           reps=reps)["median_ms"]
+        entry["speedup"] = entry["eager"] / entry["triton"]
+        rows[f"t{tokens}"] = entry
+    return dict(ok=True, results=rows)
+
+
 def benchmark_recur_kernel(*, n=128, bh=10, c=64, dk=64, dv=64, reps=10,
                            device="cuda") -> dict:
     """单独测递推 kernel，扫 dv_tile × num_warps；与 eager 循环同场对比。"""
@@ -917,6 +1023,10 @@ def run_probe(*, output: Path | str | None = None, tolerance=None,
             report["steps"]["triton_loop_correctness"] = compare_triton_loop(
                 tokens=512, chunk=64, heads=10, dk=64, dv=64)
             report["steps"]["triton_loop_benchmark"] = benchmark_triton_loop(
+                tokens_list=(2048, 8192), chunk=86, heads=10, dk=64, dv=64)
+            report["steps"]["kernel_backward_check"] = check_kernel_backward(
+                bh=2, n=4, c=64, dk=64, dv=64)
+            report["steps"]["triton_train_step"] = benchmark_triton_train_step(
                 tokens_list=(2048, 8192), chunk=86, heads=10, dk=64, dv=64)
             report["steps"]["recur_kernel_tuning"] = benchmark_recur_kernel(
                 n=128, bh=10, c=64, dk=64, dv=64)
