@@ -133,7 +133,7 @@ class GDN2Layer(nn.Module):
                  dt_max: float = 1e-1, a_log_min: float = 1.0,
                  a_log_max: float = 16.0, chunk_backend: str = "serial",
                  fused_safe_exp: float = 80.0, compile_fused: bool = False,
-                 compile_chunk: int = 64):
+                 compile_chunk: int = 64, loop_backend: str = 'eager'):
         super().__init__()
         self.n_head = n_head
         self.head_dim = d_model // n_head
@@ -190,6 +190,7 @@ class GDN2Layer(nn.Module):
         self.fused_safe_exp = float(fused_safe_exp)
         self.compile_fused = bool(compile_fused)
         self.compile_chunk = int(compile_chunk)
+        self.loop_backend = str(loop_backend)
         self.use_chunkwise = use_chunkwise
         # SLA 叠在 GDN-2 上（计划书 §9「在 +GDN/QED 上加 SLA」）：
         # G_Q/G_K 是 head 维 softmax 门控，乘在 l2norm 后的 q/k 上（论文 arXiv:2602.01744 §4.1）
@@ -297,7 +298,7 @@ class GDN2Layer(nn.Module):
                     record.update(chunk_eff=chunk_eff, dmax=dmax)
             self._chunk_eff, self._last_dmax = chunk_eff, dmax
             if self.chunk_backend == "fused":
-                if self.compile_fused:
+                if self.compile_fused and self.loop_backend != "triton":
                     from .gdn2_chunk_opt import chunkwise_fused_compiled as fused_fn
                 else:
                     from .gdn2_chunk_opt import chunkwise_fused as fused_fn
@@ -305,6 +306,7 @@ class GDN2Layer(nn.Module):
                     q, k, v, g, b, w, chunk=self.chunk, neg_clamp=self.fused_safe_exp,
                     divide_by_sqrt_t=self.divide_by_sqrt_t, l2norm_qk=True,
                     matmul_dtype=self.matmul_dtype, chunk_eff=self._chunk_eff,
+                    loop_backend=self.loop_backend,
                 )
             else:
                 chunk_forward = (gdn2_chunkwise_batched_forward if self.chunk_backend == "batched"
@@ -408,6 +410,7 @@ class HybridBackbone(nn.Module):
         gdn2_fused_safe_exp: float = 80.0,     # 仅 fused：chunk×dmax 上限，同步放宽 clamp
         gdn2_compile_fused: bool = False,      # 用 torch.compile 编译融合算子（需固定 chunk）
         gdn2_compile_chunk: int = 64,          # 编译模式下固定的 chunk（避免反复重编译）
+        gdn2_loop_backend: str = 'eager',      # 递推后端: eager | triton
         gdn2_chunk: int = 64,                  # chunkwise GDN-2 的块大小
         use_chunkwise: bool = True,            # 逐 token 循环太慢，默认用 chunkwise
     ):
@@ -447,6 +450,7 @@ class HybridBackbone(nn.Module):
                     fused_safe_exp=gdn2_fused_safe_exp,
                     compile_fused=gdn2_compile_fused,
                     compile_chunk=gdn2_compile_chunk,
+                    loop_backend=gdn2_loop_backend,
                 ))
         self.blocks = nn.ModuleList(blocks)
         self.norm_f = RMSNorm(d_model)

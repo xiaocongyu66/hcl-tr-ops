@@ -20,6 +20,7 @@ model:
   gdn2_chunk: 512
   gdn2_chunk_backend: fused          # A/P 单次 GEMM + UT 变换 + 放宽 clamp 的大 chunk
   gdn2_fused_safe_exp: 80.0          # chunk×dmax 上限；与 exp(-G) 的 clamp 同步放宽
+  gdn2_loop_backend: triton          # 融合递推 kernel（T4 实测 8K 1.86×）
   gdn2_matmul_dtype: fp32
 
 # 训练种子（所有归因组必须相同）

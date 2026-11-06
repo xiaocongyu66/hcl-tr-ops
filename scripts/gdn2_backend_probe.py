@@ -514,6 +514,172 @@ def benchmark_torch_features(*, tokens_list=(2048, 8192), chunk=86, heads=10, dk
     return dict(ok=True, capabilities=caps, results=rows)
 
 
+def compare_triton_loop(*, tokens=512, chunk=64, heads=10, dk=64, dv=64,
+                        device="cuda") -> dict:
+    """Triton 融合递推与 eager 循环的前向/反向一致性。"""
+    if device == "cuda" and not torch.cuda.is_available():
+        return dict(ok=False, error="需要 CUDA")
+    from hcl_tr.models.gdn2_chunk_opt import chunkwise_fused
+    try:
+        from hcl_tr.models.gdn2_recur_triton import HAS_TRITON
+    except Exception as exc:  # noqa: BLE001
+        return dict(ok=False, error=f"triton 导入失败: {exc}")
+    if not HAS_TRITON:
+        return dict(ok=False, error="triton 不可用")
+
+    # 先用随机小张量单独校验 kernel 本身（与布局/算子无关）。
+    from hcl_tr.models.gdn2_recur_triton import recurrence_eager, recurrence_triton
+    g = torch.Generator(device=device).manual_seed(5)
+    _bh, _n, _c, _dk, _dv = 2, 4, 64, 64, 64
+    _px0 = torch.randn(_bh, _n, _c, _dv, generator=g, device=device)
+    _qeff = torch.randn(_bh, _n, _c, _dk, generator=g, device=device)
+    _x0 = torch.randn(_bh, _n, _c, _dv, generator=g, device=device)
+    _x1 = torch.randn(_bh, _n, _c, _dk, generator=g, device=device)
+    _kl = torch.randn(_bh, _n, _c, _dk, generator=g, device=device)
+    _dec = torch.rand(_bh, _n, _dk, generator=g, device=device)
+    _kd = (recurrence_triton(_x0, _x1, _kl, _px0, _qeff, _dec)
+           - recurrence_eager(_px0, _qeff, _x0, _x1, _kl, _dec))
+    kern_diff = float(_kd.abs().max())
+    kern_per_bh = [float(_kd[i].abs().max()) for i in range(_bh)]
+    kern_ref_absmax = float(recurrence_eager(_px0, _qeff, _x0, _x1, _kl, _dec).abs().max())
+    # n=1 时 s=0，输出应严格等于 px0；用于区分“索引错误”与“状态递推误差”。
+    _c1 = lambda t: t[:, :1].contiguous()
+    _e1 = recurrence_eager(_c1(_px0), _c1(_qeff), _c1(_x0), _c1(_x1),
+                           _c1(_kl), _c1(_dec))
+    _t1 = recurrence_triton(_c1(_x0), _c1(_x1), _c1(_kl), _c1(_px0),
+                            _c1(_qeff), _c1(_dec))
+    n1_diff = float((_t1 - _e1).abs().max())
+
+    # 大动态范围：分别与 fp64 真值比较，判断是 kernel 精度还是数据条件数。
+    g2 = torch.Generator(device=device).manual_seed(7)
+    _x0b = torch.randn(2, 4, 64, 64, generator=g2, device=device) * 1e6
+    _x1b = torch.randn(2, 4, 64, 64, generator=g2, device=device) * 1e6
+    _klb = torch.rand(2, 4, 64, 64, generator=g2, device=device)
+    _px0b = torch.randn(2, 4, 64, 64, generator=g2, device=device)
+    _qeffb = torch.randn(2, 4, 64, 64, generator=g2, device=device)
+    _decb = torch.rand(2, 4, 64, generator=g2, device=device)
+    truth64 = recurrence_eager(*(t.double() for t in
+                                 (_px0b, _qeffb, _x0b, _x1b, _klb, _decb)))
+    kern_err = float((recurrence_triton(_x0b, _x1b, _klb, _px0b, _qeffb, _decb)
+                      .double() - truth64).abs().max())
+    eager_err = float((recurrence_eager(_px0b, _qeffb, _x0b, _x1b, _klb, _decb)
+                       .double() - truth64).abs().max())
+    dyn = dict(truth_absmax=float(truth64.abs().max()),
+               triton_vs_fp64=kern_err, eager_vs_fp64=eager_err)
+
+    t = make_tensors(device=device, batch=1, tokens=tokens, heads=heads, dk=dk, dv=dv,
+                     seed=17, realistic_decay=True)
+    args = [t[k] for k in ("q", "k", "v", "g", "b", "w")]
+    kw = dict(chunk=chunk, chunk_eff=chunk, solve="reference", neg_clamp=80.0)
+
+    eager_in = [x.detach().requires_grad_(True) for x in args]
+    tri_in = [x.detach().requires_grad_(True) for x in args]
+    eager = chunkwise_fused(*eager_in, **kw)
+    tri = chunkwise_fused(*tri_in, loop_backend="triton", **kw)
+    fwd = float((tri.float() - eager.float()).abs().max())
+    n_chunks = tokens // chunk
+    eag_c = eager.reshape(1, n_chunks, chunk, heads, dv)
+    tri_c = tri.reshape(1, n_chunks, chunk, heads, dv)
+    per_chunk = [float((tri_c[:, i] - eag_c[:, i]).abs().max()) for i in range(n_chunks)]
+    # 检测是否是 token/块位移，而不是数值误差
+    shift_fwd = float((tri[0, :-1] - eager[0, 1:]).abs().max())
+    shift_bwd = float((tri[0, 1:] - eager[0, :-1]).abs().max())
+    chunk_perm = [float((tri_c[:, 0] - eag_c[:, j]).abs().max()) for j in range(n_chunks)]
+    stats = dict(kernel_only_max_abs=kern_diff, kern_per_bh=kern_per_bh,
+                 kern_ref_absmax=kern_ref_absmax, n1_diff=n1_diff, **dyn,
+                 eager_absmax=float(eager.abs().max()),
+                 relative=fwd / max(float(eager.abs().max()), 1e-30),
+                 per_chunk_first=per_chunk[:3], per_chunk_last=per_chunk[-2:],
+                 head_eager=eager[0, 0, :3].tolist(), head_tri=tri[0, 0, :3].tolist(),
+                 shift_fwd=shift_fwd, shift_bwd=shift_bwd,
+                 chunk0_best_match=int(min(range(n_chunks), key=lambda j: chunk_perm[j])),
+                 chunk0_match_err=float(min(chunk_perm)))
+    weight = torch.randn_like(eager)
+    (eager * weight).sum().backward()
+    (tri * weight).sum().backward()
+    grads = [float((a.grad - b.grad).abs().max()) for a, b in zip(tri_in, eager_in)]
+    ok = (fwd <= 1e-4 and all(g <= 1e-4 for g in grads)
+          and bool(torch.isfinite(tri).all()))
+    return dict(ok=ok, tokens=tokens, chunk=chunk, forward_max_abs=fwd,
+                grad_each_max_abs=grads, grad_max_abs=max(grads), **stats)
+
+
+def benchmark_recur_kernel(*, n=128, bh=10, c=64, dk=64, dv=64, reps=10,
+                           device="cuda") -> dict:
+    """单独测递推 kernel，扫 dv_tile × num_warps；与 eager 循环同场对比。"""
+    if device == "cuda" and not torch.cuda.is_available():
+        return dict(ok=False, error="需要 CUDA")
+    from hcl_tr.models.gdn2_recur_triton import (HAS_TRITON, recurrence_eager,
+                                                 recurrence_triton)
+    if not HAS_TRITON:
+        return dict(ok=False, error="triton 不可用")
+    _warm_clocks()
+    g = torch.Generator(device=device).manual_seed(3)
+    x0 = torch.randn(bh, n, c, dv, generator=g, device=device)
+    x1 = torch.randn(bh, n, c, dk, generator=g, device=device) * 0.1
+    kl = torch.rand(bh, n, c, dk, generator=g, device=device)
+    px0 = torch.randn(bh, n, c, dv, generator=g, device=device)
+    qeff = torch.randn(bh, n, c, dk, generator=g, device=device) * 0.1
+    dec = torch.rand(bh, n, dk, generator=g, device=device)
+    out = {"eager": time_callable(
+        lambda: recurrence_eager(px0, qeff, x0, x1, kl, dec),
+        warmup=2, reps=reps)["median_ms"]}
+    for dv_tile, warps in ((32, 4), (64, 4), (64, 8), (32, 8)):
+        key = f"triton_dv{dv_tile}_w{warps}"
+        try:
+            out[key] = time_callable(
+                lambda dv_tile=dv_tile, warps=warps: recurrence_triton(
+                    x0, x1, kl, px0, qeff, dec, dv_tile=dv_tile, num_warps=warps),
+                warmup=2, reps=reps)["median_ms"]
+            ref = recurrence_eager(px0, qeff, x0, x1, kl, dec)
+            err = float((recurrence_triton(x0, x1, kl, px0, qeff, dec,
+                                           dv_tile=dv_tile,
+                                           num_warps=warps) - ref).abs().max())
+            out[key + "_err"] = err
+        except Exception as exc:  # noqa: BLE001
+            out[key] = f"{type(exc).__name__}: {exc}"
+    return dict(ok=True, bh=bh, n=n, c=c, dk=dk, dv=dv, results=out)
+
+
+def benchmark_triton_loop(*, tokens_list=(2048, 8192), chunk=86, heads=10, dk=64,
+                          dv=64, reps=5, device="cuda") -> dict:
+    """同场对比：eager(86) / eager(64) / Triton(64)。
+
+    Triton 需要 2 的幂块大小，会把 86 向下取整到 64；同时给出 eager(64)
+    以区分“块大小变化”和“kernel 本身”的收益。
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        return dict(ok=False, error="需要 CUDA")
+    from hcl_tr.models.gdn2_chunk_opt import chunkwise_fused
+    try:
+        from hcl_tr.models.gdn2_recur_triton import HAS_TRITON
+    except Exception:  # noqa: BLE001
+        HAS_TRITON = False
+    if not HAS_TRITON:
+        return dict(ok=False, error="triton 不可用")
+
+    _warm_clocks()
+    rows = {}
+    for tokens in tokens_list:
+        t = make_tensors(device=device, batch=1, tokens=tokens, heads=heads, dk=dk, dv=dv,
+                         seed=1, realistic_decay=True)
+        args = (t["q"], t["k"], t["v"], t["g"], t["b"], t["w"])
+        base = dict(solve="reference", neg_clamp=80.0)
+        entry = {}
+        for name, f in (
+            ("eager_c86", lambda: chunkwise_fused(*args, chunk=86, chunk_eff=86, **base)),
+            ("eager_c64", lambda: chunkwise_fused(*args, chunk=64, chunk_eff=64, **base)),
+            ("triton_c64", lambda: chunkwise_fused(*args, chunk=86, chunk_eff=86,
+                                                   loop_backend="triton", **base)),
+        ):
+            timing = time_callable(f, warmup=2, reps=reps)
+            entry[name] = timing["median_ms"]
+        entry["triton_vs_eager86"] = entry["eager_c86"] / entry["triton_c64"]
+        entry["triton_vs_eager64"] = entry["eager_c64"] / entry["triton_c64"]
+        rows[f"t{tokens}"] = entry
+    return dict(ok=True, results=rows)
+
+
 def benchmark_stage_compare(*, tokens=8192, chunk=512, heads=10, dk=64, dv=64,
                             reps=5, device="cuda") -> dict:
     """把"参考实现 vs 融合实现"的差异定位到具体算子。
@@ -745,6 +911,19 @@ def run_probe(*, output: Path | str | None = None, tolerance=None,
                 tokens=256, chunk=86, heads=10, dk=64, dv=64)
             report["steps"]["fused_profile"] = profile_fused_kernels(
                 tokens=8192, chunk=86, heads=10, dk=64, dv=64)
+            report["steps"]["triton_loop_correctness"] = compare_triton_loop(
+                tokens=512, chunk=64, heads=10, dk=64, dv=64)
+            report["steps"]["triton_loop_benchmark"] = benchmark_triton_loop(
+                tokens_list=(2048, 8192), chunk=86, heads=10, dk=64, dv=64)
+            report["steps"]["recur_kernel_tuning"] = benchmark_recur_kernel(
+                n=128, bh=10, c=64, dk=64, dv=64)
+            report["steps"]["triton_head_scan"] = {
+                f"heads{h}": {k: v for k, v in compare_triton_loop(
+                    tokens=256, chunk=64, heads=h, dk=64, dv=64).items()
+                    if k in ("ok", "forward_max_abs", "kernel_only_max_abs",
+                             "per_chunk_first", "per_chunk_last",
+                             "eager_absmax", "head_eager", "head_tri")}
+                for h in (1, 2)}
         except Exception as exc:  # noqa: BLE001
             report["blockers"].append(f"PyTorch batched 对照失败: {type(exc).__name__}: {exc}")
     report["feasible"] = (not report["blockers"]

@@ -17,6 +17,7 @@ model:
   gdn2_chunk: 512
   gdn2_chunk_backend: fused
   gdn2_fused_safe_exp: 80.0
+  gdn2_loop_backend: triton
   gdn2_matmul_dtype: fp32
 
 seed: 0

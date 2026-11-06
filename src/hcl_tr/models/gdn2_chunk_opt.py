@@ -94,6 +94,7 @@ def chunkwise_fused(
     l2norm_qk: bool = True, solve: str = "blocked", block: int = 64,
     matmul_dtype: torch.dtype = torch.float32, chunk_eff: int | None = None,
     chunk_override: int | None = None, neg_clamp: float = 40.0,
+    loop_backend: str = "eager",
 ):
     """等价于 gdn2_ref.gdn2_chunkwise_batched_forward 的融合实现。
 
@@ -108,7 +109,8 @@ def chunkwise_fused(
             q, k, v, g, b, w, chunk=chunk, divide_by_sqrt_t=divide_by_sqrt_t,
             l2norm_qk=l2norm_qk, solve=solve, block=block,
             matmul_dtype=matmul_dtype, chunk_eff=chunk_eff,
-            chunk_override=chunk_override, neg_clamp=neg_clamp)
+            chunk_override=chunk_override, neg_clamp=neg_clamp,
+            loop_backend=loop_backend)
 
 
 def _chunkwise_fused_impl(
@@ -116,6 +118,7 @@ def _chunkwise_fused_impl(
     l2norm_qk: bool = True, solve: str = "blocked", block: int = 64,
     matmul_dtype: torch.dtype = torch.float32, chunk_eff: int | None = None,
     chunk_override: int | None = None, neg_clamp: float = 40.0,
+    loop_backend: str = "eager",
 ):
     if solve not in ("blocked", "reference"):
         raise ValueError(f"不支持的 solve 模式: {solve}")
@@ -135,6 +138,14 @@ def _chunkwise_fused_impl(
         chunk_eff = chunk if dmax <= 0 else max(1, min(chunk, int(safe_exp / dmax)))
     if chunk_override is not None:
         chunk_eff = max(1, min(chunk, int(chunk_override)))
+    if loop_backend == "triton":
+        # Triton 的 tl.arange/tl.dot 要求块大小为 2 的幂：向下取整仍然安全
+        # （更小的 chunk 意味着更小的指数范围），但低于 16 时退回 eager。
+        p = 1 << (int(chunk_eff).bit_length() - 1)
+        if p < 16:
+            loop_backend = "eager"
+        else:
+            chunk_eff = p
     chunk = int(chunk_eff)
     n = (tokens + chunk - 1) // chunk
     pad = n * chunk - tokens
@@ -185,18 +196,43 @@ def _chunkwise_fused_impl(
     k_last_all = K * torch.exp((cum_last - cum).clamp(min=-neg_clamp))
     decay_all = exp_cum[..., -1, :]
 
-    md = matmul_dtype
-    state = torch.zeros(batch, heads, dk, dv, device=dev, dtype=torch.float32)
-    outs = []
-    for i in range(n):
-        s_m = state.to(md)
-        x = (x0[:, i] - x1[:, i] @ s_m.float()).to(md)
-        outs.append((px0[:, i] + qeff[:, i] @ s_m).permute(0, 2, 1, 3))
-        decay = decay_all[:, i]
-        state = decay.unsqueeze(-1).float() * state + (
-            k_last_all[:, i].transpose(-1, -2) @ x).float()
+    use_triton = (loop_backend == "triton" and dev.type == "cuda"
+                  and matmul_dtype == torch.float32)
+    if use_triton:
+        from .gdn2_recur_triton import HAS_TRITON
+        use_triton = HAS_TRITON
+    if use_triton:
+        from .gdn2_recur_triton import recurrence
+        # 循环内先算 x = X0 − X1·S，再做 K_Lᵀ·x；与 eager 路径数值一致。
+        # （曾改写成 (K_LᵀX0) − (K_LᵀX1)·S，大指数下相消导致 0.85 的偏差。）
+        bh = batch * heads
+        # [B,N,H,...] -> [B*H,N,...]
+        # 必须 .contiguous()：permute+reshape 可能返回非连续视图，
+        # 而 kernel 按连续布局计算偏移，读到交错数据会导致结果错误。
+        px0_f = px0.permute(0, 2, 1, 3, 4).reshape(bh, n, chunk, dv).contiguous()
+        qeff_f = qeff.permute(0, 2, 1, 3, 4).reshape(bh, n, chunk, dk).contiguous()
+        x0_f = x0.permute(0, 2, 1, 3, 4).reshape(bh, n, chunk, dv).contiguous()
+        x1_f = x1.permute(0, 2, 1, 3, 4).reshape(bh, n, chunk, dk).contiguous()
+        kl_f = k_last_all.permute(0, 2, 1, 3, 4).reshape(bh, n, chunk, dk).contiguous()
+        dec_f = decay_all.permute(0, 2, 1, 3).reshape(bh, n, dk).contiguous()
+        o = recurrence(x0_f, x1_f, kl_f, px0_f, qeff_f, dec_f)   # [B*H,N,C,dv]
+        o = o.reshape(batch, heads, n, chunk, dv)
+        o = o.permute(0, 2, 1, 3, 4)                 # [B,N,H,C,dv]
+        o = o.permute(0, 1, 3, 2, 4)                 # [B,N,C,H,dv]
+        o = o.reshape(batch, n * chunk, heads, dv)[:, :tokens].float()
+    else:
+        md = matmul_dtype
+        state = torch.zeros(batch, heads, dk, dv, device=dev, dtype=torch.float32)
+        outs = []
+        for i in range(n):
+            s_m = state.to(md)
+            x = (x0[:, i] - x1[:, i] @ s_m.float()).to(md)
+            outs.append((px0[:, i] + qeff[:, i] @ s_m).permute(0, 2, 1, 3))
+            decay = decay_all[:, i]
+            state = decay.unsqueeze(-1).float() * state + (
+                k_last_all[:, i].transpose(-1, -2) @ x).float()
 
-    o = torch.cat(outs, dim=1)[:, :tokens].float()
+        o = torch.cat(outs, dim=1)[:, :tokens].float()
     if divide_by_sqrt_t:
         o = o / _inv_sqrt_t(tokens, dev)
     return o
