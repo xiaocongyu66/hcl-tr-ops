@@ -134,6 +134,39 @@ def recurrence_eager(px0, qeff, x0, x1, kl, dec):
     return torch.stack(outs, dim=1)
 
 
+def _is_pow2(x: int) -> bool:
+    return x > 0 and (x & (x - 1)) == 0
+
+
+def validate_triton_shapes(chunk: int, dk: int, dv: int, dv_tile: int) -> int:
+    """kernel 假设块大小是 2 的幂且 dv 能被 tile 整除；不满足会静默越界写。
+
+    Triton 的 tl.arange/tl.dot 要求参与切块的维度是 2 的幂且 >=16；
+    dv 本身可以不是 2 的幂，但必须能被 dv_tile 整除。
+    """
+    if not (_is_pow2(chunk) and chunk >= 16):
+        raise ValueError(f"chunk 必须是 >=16 的 2 的幂，得到 {chunk}")
+    if not (_is_pow2(dk) and dk >= 16):
+        raise ValueError(f"dk 必须是 >=16 的 2 的幂，得到 {dk}")
+    if not (_is_pow2(dv_tile) and dv_tile >= 16):
+        raise ValueError(f"dv_tile 必须是 >=16 的 2 的幂，得到 {dv_tile}")
+    if dv < dv_tile or dv % dv_tile:
+        raise ValueError(
+            f"dv({dv}) 必须是 dv_tile({dv_tile}) 的整数倍且不小于它，"
+            "否则 kernel 会读写越界")
+    return dv_tile
+
+
+def select_dv_tile(dv: int, requested: int = 32) -> int:
+    """选一个能整除 dv 且不超过 requested 的 2 的幂（>=16）。"""
+    tile = min(requested, dv)
+    while tile >= 16:
+        if _is_pow2(tile) and dv % tile == 0:
+            return tile
+        tile //= 2
+    raise ValueError(f"dv({dv}) 不能被任何 >=16 的 2 的幂整除，Triton 递推不支持")
+
+
 def recurrence_triton(x0, x1, kl, px0, qeff, dec, dv_tile: int = 32,
                       num_warps: int = 8, states=None):
     if not HAS_TRITON:
@@ -147,7 +180,7 @@ def recurrence_triton(x0, x1, kl, px0, qeff, dec, dv_tile: int = 32,
     bh, n, chunk, dk = qeff.shape
     dv = px0.shape[-1]
     out = torch.empty_like(px0)
-    dv_tile = max(16, min(dv_tile, dv))
+    dv_tile = validate_triton_shapes(chunk, dk, dv, select_dv_tile(dv, dv_tile))
     grid = (bh, triton.cdiv(dv, dv_tile))
     save = states is not None
     _recur_kernel[grid](x0, x1, kl, px0, qeff, dec, out,
@@ -165,7 +198,7 @@ def recurrence_triton_backward(do, x0, x1, kl, qeff, dec, states,
             raise ValueError(f"recurrence_triton_backward 需要连续张量：{name} 非连续")
     bh, n, chunk, dk = qeff.shape
     dv = x0.shape[-1]
-    dv_tile = max(16, min(dv_tile, dv))
+    dv_tile = validate_triton_shapes(chunk, dk, dv, select_dv_tile(dv, dv_tile))
     nt = triton.cdiv(dv, dv_tile)
     do = do.contiguous()
     dx0 = torch.empty_like(x0)

@@ -47,11 +47,11 @@ optimizer:
 grad_clip: 1.0
 
 batch:
-  micro_batch_per_gpu: 4
+  micro_batch_per_gpu: 2
   seq_len: 4096
-  grad_accum: 4           # 2 卡 × 4 × 4 × 4096 = 131072 global tokens
+  grad_accum: 4           # 2 卡 × 2 × 4 × 4096 = 65536 global tokens（小批次，更多更新步）
   n_gpu: 2
-  global_batch_tokens: 131072
+  global_batch_tokens: 65536
 
 lr:
   sweep: [5e-4]

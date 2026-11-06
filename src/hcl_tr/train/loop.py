@@ -25,6 +25,14 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 
+def _loss_spike_multiplier(value, default: float = 3.0) -> float:
+    """解析配置里的 "3x running median" 形式；无法解析时用默认值。"""
+    try:
+        return float(str(value).strip().lower().split("x")[0])
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class TrainConfig:
     seq_len: int = 8192
@@ -280,6 +288,16 @@ def train(model, stream, cfg: TrainConfig, device: str = "cuda",
                 "data_manifest": data_manifest, "runtime_states": states,
                 "exact_resume_available": data_manifest is not None}
 
+    skipped_steps = 0
+    consecutive_skips = 0
+    exhausted = False
+    step_tokens = cfg.micro_batch_per_gpu * cfg.grad_accum * cfg.seq_len
+    trained_tokens = consumed
+    last_step_time = time.time()
+    last_step_tokens = consumed
+    monitor_cfg = (cfg.fields.get("config") or {}).get("monitor") or {}
+    spike_mult = _loss_spike_multiplier(monitor_cfg.get("loss_spike_threshold", "3x"))
+
     for step in range(start_step, total_steps_local):
         loss_acc = None
         exhausted = False
@@ -315,11 +333,17 @@ def train(model, stream, cfg: TrainConfig, device: str = "cuda",
                             batch, suffix_len=cfg.spar_suffix_len,
                             chunk_size=cfg.spar_chunk_size, generator=spar_gen)
                         logits_k = model(corrupt_ids[:, :-1])
+                        # 真正的短上下文：只保留 suffix，单独前向。
+                        short_len = min(cfg.spar_suffix_len, batch.shape[1] - 1)
+                        short_ids = batch[:, batch.shape[1] - short_len:]
+                        logits_s = model(short_ids[:, :-1])
+                        short_start = labels.shape[1] - short_len + 1
                         if hasattr(raw_model, "chunk_stats"):
                             views.append(raw_model.chunk_stats())
                         mask = spargate_suffix_mask(
                             logits, logits_k, labels,
-                            suffix_start=max(0, labels.shape[1] - cfg.spar_suffix_len),
+                            suffix_start=short_start,
+                            logits_short=logits_s,
                             nll_threshold=cfg.spar_nll_threshold,
                             gain_threshold=cfg.spar_gain_threshold)
                         loss, _, _ = spar_loss(logits.float(), logits_k.float(), labels, mask,
@@ -345,13 +369,26 @@ def train(model, stream, cfg: TrainConfig, device: str = "cuda",
             dist.all_reduce(invalid_grad, op=dist.ReduceOp.MAX)
         if bool(invalid_grad.item()):
             raise RuntimeError("梯度范数非有限值，拒绝更新或保存成功 checkpoint")
+        # GradScaler 在检测到 inf 时会跳过 step 并缩小 scale。跳过的步
+        # 既不算训练量，也不能推进 lr schedule，否则 token 口径会虚高。
+        scale_before = scaler.get_scale()
         scaler.step(opt)
         scaler.update()
+        skipped = scaler.get_scale() < scale_before
         opt.zero_grad(set_to_none=True)
-        sched.step()
-
-        # 已 step 的量 = 已实际训练的量（不再有"喂了但没 step"的浪费）
-        consumed = (step + 1) * cfg.micro_batch_per_gpu * cfg.grad_accum * cfg.seq_len
+        if skipped:
+            skipped_steps += 1
+            consecutive_skips += 1
+            if consecutive_skips >= 5:
+                raise RuntimeError(
+                    f"连续 {consecutive_skips} 步因 fp16 溢出被跳过，停止运行")
+        else:
+            consecutive_skips = 0
+            sched.step()
+            trained_tokens += step_tokens
+        # consumed 始终是「已消费的数据量」，用于续训定位与预算对齐；
+        # 跳过的步只影响 trained_tokens 与 lr schedule。
+        consumed = (step + 1) * step_tokens
 
         if ddp and dist.is_initialized():
             dist.all_reduce(loss_acc, op=dist.ReduceOp.SUM)
@@ -359,11 +396,24 @@ def train(model, stream, cfg: TrainConfig, device: str = "cuda",
         loss_value = float(loss_acc) if loss_acc is not None else float("nan")
         if not math.isfinite(loss_value):
             raise RuntimeError("训练 loss 非有限值，停止运行")
-        elapsed = time.time() - t0
+        now = time.time()
+        elapsed = now - t0
         global_tok_s = (consumed - resume_tokens) * world / max(1e-9, elapsed)
+        inst_tok_s = ((consumed - last_step_tokens) * world
+                      / max(1e-9, now - last_step_time))
+        last_step_time, last_step_tokens = now, consumed
+        _cs = raw_model.chunk_stats() if hasattr(raw_model, "chunk_stats") else {}
+        _ce = sorted({v[0] for v in _cs.values()}) if _cs else []
+        _dm = max((v[1] for v in _cs.values()), default=0.0)
         metric = {"step": step, "steps_completed": step + 1, "loss": loss_value,
+                  "lr": sched.get_last_lr()[0],
+                  "grad_norm": float(grad_norm),
+                  "loss_scale": float(scaler.get_scale()),
+                  "skipped_steps": skipped_steps,
+                  "trained_tokens": trained_tokens * world,
                   "tokens_local": consumed, "tokens_global": consumed * world,
                   "world_size": world, "global_tok_s": global_tok_s,
+                  "inst_tok_s": inst_tok_s, "dmax": _dm, "chunk_eff": _ce,
                   "microbatches": microbatch_stats, "rank": local_rank}
         with (out / f"metrics_rank{local_rank}.jsonl").open("a") as f:
             f.write(json.dumps(metric, allow_nan=False) + "\n")
@@ -376,15 +426,19 @@ def train(model, stream, cfg: TrainConfig, device: str = "cuda",
             spike = False
             if len(loss_hist) > 20:
                 med = sorted(loss_hist[-20:])[len(loss_hist[-20:]) // 2]
-                spike = loss_hist[-1] > 3 * med
-            _cs = raw_model.chunk_stats() if hasattr(raw_model, "chunk_stats") else {}
-            _ce = sorted({v[0] for v in _cs.values()}) if _cs else []
-            _dm = max((v[1] for v in _cs.values()), default=0.0)
+                spike = loss_hist[-1] > spike_mult * med
+            # chunk_eff < 16 时 Triton 会回退 eager，吞吐会掉一个数量级；
+            # 这是退化信号，必须显式打印出来。
+            collapsed = bool(_ce) and min(_ce) < 16
             print(f"step {step} loss {loss_value:.4f} "
                   f"lr {lr:.2e} tokens_local {consumed} tokens_global {consumed * world} "
+                  f"trained {trained_tokens * world} skipped {skipped_steps} "
                   f"world_size {world} global_tok_s {global_tok_s:.0f} "
+                  f"inst_tok_s {inst_tok_s:.0f} grad_norm {float(grad_norm):.3f} "
+                  f"scale {float(scaler.get_scale()):.0f} "
                   f"dmax {_dm:.2f} chunk_eff {_ce}"
-                  + ("  [LOSS SPIKE]" if spike else ""), flush=True)
+                  + ("  [LOSS SPIKE]" if spike else "")
+                  + ("  [CHUNK COLLAPSE]" if collapsed else ""), flush=True)
 
         # 按「距上次存档的 token 数」触发，而不是数目录里的文件——
         # 后者在换输出目录/多 rank 时会漂移。
@@ -410,6 +464,10 @@ def train(model, stream, cfg: TrainConfig, device: str = "cuda",
         print(f"done: tokens_global={consumed * world} tokens_local={consumed} world_size={world}", flush=True)
     # 每个 rank 都写自己的实际训练量，供 train_ddp 汇总
     (out / f"consumed_rank{local_rank}.txt").write_text(str(consumed))
+    if skipped_steps:
+        (out / f"skipped_rank{local_rank}.txt").write_text(str(skipped_steps))
+    if exhausted:
+        (out / f"exhausted_rank{local_rank}.txt").write_text(str(step))
     return consumed
 
 
@@ -485,8 +543,13 @@ def _collect_consumed(out, world_size, cfg):
     per_step = cfg.micro_batch_per_gpu * cfg.grad_accum * cfg.seq_len * world_size
     expected = max(1, cfg.total_tokens // per_step) * per_step
     total = sum(consumed)
-    if total != expected:
-        raise RuntimeError(f"未完成完整步预算: tokens_global={total}, expected={expected}")
+    exhausted = all(
+        (Path(out) / f"exhausted_rank{r}.txt").exists() for r in range(world_size))
+    if total > expected:
+        raise RuntimeError(f"超出步预算: tokens_global={total}, expected={expected}")
+    if total < expected and not exhausted:
+        raise RuntimeError(
+            f"未完成完整步预算且非数据耗尽: tokens_global={total}, expected={expected}")
     return total
 
 

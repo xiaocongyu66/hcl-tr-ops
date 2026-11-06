@@ -20,6 +20,11 @@ def _logits(seed, sharpen=1.0):
     return torch.randn(B, T, V, generator=g) * sharpen
 
 
+def _short(seed):
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(B, T - SUFFIX_START, V, generator=g) * 5.0
+
+
 def _targets():
     g = torch.Generator().manual_seed(99)
     return torch.randint(0, V, (B, T), generator=g)
@@ -64,7 +69,7 @@ def test_gate_selects_only_suffix():
     lc = _logits(7, sharpen=5.0)   # 高置信 → short NLL 低
     lk = _logits(8, sharpen=5.0)
     t = _targets()
-    r = gate.suffix_likelihood_gate(lc, lk, t, SUFFIX_START)
+    r = gate.suffix_likelihood_gate(lc, lk, t, SUFFIX_START, logits_short=_short(31))
     mask = r["mask"]
     assert mask[:, :SUFFIX_START].sum() == 0, "prefix 区不应被选中"
     # 阈值很宽 → suffix 区应全选
@@ -77,7 +82,7 @@ def test_gate_rejects_high_nll():
     lc = _logits(9, sharpen=1.0)
     lk = _logits(10, sharpen=1.0)
     t = _targets()
-    r = gate.suffix_likelihood_gate(lc, lk, t, SUFFIX_START)
+    r = gate.suffix_likelihood_gate(lc, lk, t, SUFFIX_START, logits_short=_short(31))
     assert r["mask"].sum() == 0
 
 
@@ -87,7 +92,7 @@ def test_gate_audit_ratios_and_freeze_flag():
     lc = _logits(11, sharpen=5.0)
     lk = _logits(12, sharpen=5.0)
     t = _targets()
-    r = gate.suffix_likelihood_gate(lc, lk, t, SUFFIX_START)
+    r = gate.suffix_likelihood_gate(lc, lk, t, SUFFIX_START, logits_short=_short(31))
 
     audit = gate_audit(r["mask"], r["nll_short"], r["gain"], 1e9, 1e9, suffix_start=SUFFIX_START)
     assert audit["false_gate_ratio"] < 1e-9
@@ -105,7 +110,7 @@ def test_gate_selects_only_suffix_semantics():
     gate = SPARGate(mode="suffix_likelihood", L_suffix=4, nll_threshold=1e9, gain_threshold=1e9)
     lc, lk = _logits(21, sharpen=5.0), _logits(22, sharpen=5.0)
     t = _targets()
-    r = gate.suffix_likelihood_gate(lc, lk, t, SUFFIX_START)
+    r = gate.suffix_likelihood_gate(lc, lk, t, SUFFIX_START, logits_short=_short(31))
     assert r["mask"][:, :SUFFIX_START].sum() == 0
     assert r["mask"][:, SUFFIX_START:].all()
 
@@ -156,3 +161,16 @@ def test_spar_loss_prefers_matching_distributions():
     _, l_clm, l_inv = spar_loss(lg, lg.clone(), tgt, mask)
     assert l_inv.item() < 1e-6
     assert l_clm.item() > 0
+
+
+def test_gate_requires_true_short_context_logits():
+    """不允许用全上下文 logits 冒充短上下文；缺失时必须报错。"""
+    import pytest
+    from hcl_tr.models.spar import spargate_suffix_mask
+
+    gate = SPARGate(mode="suffix_likelihood", L_suffix=4)
+    lc, lk, t = _logits(41), _logits(42), _targets()
+    with pytest.raises(ValueError, match='短上下文'):
+        gate.suffix_likelihood_gate(lc, lk, t, SUFFIX_START)
+    with pytest.raises(ValueError, match='短上下文'):
+        spargate_suffix_mask(lc, lk, t, SUFFIX_START)

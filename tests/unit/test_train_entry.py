@@ -47,3 +47,16 @@ def test_lr_override_wins():
     tcfg = entry.train_config_from_config(cfg, lr=1e-4, out_dir='out',
                                           resume_from=None, ckpt_sha256=None)
     assert tcfg.lr == pytest.approx(1e-4)
+
+
+def test_batch_product_mismatch_is_rejected():
+    cfg = yaml.safe_load((REPO / 'src/hcl_tr/configs/stage0_mvp1a.yaml').read_text())
+    tcfg = entry.train_config_from_config(cfg, lr=None, out_dir='out',
+                                          resume_from=None, ckpt_sha256=None)
+    entry.validate_batch_product(tcfg, n_gpu=2)          # 2×8×8192×2 = 262144
+    with pytest.raises(SystemExit, match='batch 口径不一致'):
+        entry.validate_batch_product(tcfg, n_gpu=1)
+
+
+def test_only_stage0_is_implemented():
+    assert entry.IMPLEMENTED_STAGES == {'0'}

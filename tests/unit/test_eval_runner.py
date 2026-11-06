@@ -13,6 +13,14 @@ from hcl_tr.eval.runner import (
 PREREG = "src/hcl_tr/configs/sniah1_ruler_prereg_v1.0.yaml"
 
 
+def _enc(text):
+    return text.split()
+
+
+def _dec(ids):
+    return " ".join(ids)
+
+
 def test_load_prereg_reads_yaml_values():
     p = load_prereg(PREREG)
     assert p["lengths"] == [512, 1024, 2048, 4096, 8192]
@@ -30,7 +38,7 @@ def test_load_prereg_rejects_missing_keys(tmp_path):
 
 def test_build_tasks_follows_prereg_grid():
     p = load_prereg(PREREG)
-    tasks = build_tasks(p, seed=0)
+    tasks = build_tasks(p, seed=0, encode=_enc, decode=_dec)
     n = len(p["lengths"]) * p["samples_per_length"]
     assert len(tasks) == n
     assert {t.length for t in tasks} == set(p["lengths"])
@@ -38,7 +46,7 @@ def test_build_tasks_follows_prereg_grid():
 
 def test_build_tasks_embed_needle_and_answer_matches():
     p = load_prereg(PREREG)
-    t = build_tasks(p, seed=1)[0]
+    t = build_tasks(p, seed=1, encode=_enc, decode=_dec)[0]
     assert t.answer in t.prompt, "needle 必须出现在 prompt 里"
     assert t.answer == t.needle
 
@@ -55,14 +63,14 @@ def test_evaluate_all_correct_gives_full_accuracy():
         import re
         m = re.search(r"magic-\d{6}", prompt)
         return m.group(0) if m else ""
-    r = evaluate(perfect, p)
+    r = evaluate(perfect, p, encode=_enc, decode=_dec)
     for L, (s, n) in r["acc_by_length"].items():
         assert s == n, (L, s, n)
 
 
 def test_evaluate_all_wrong_gives_zero():
     p = load_prereg(PREREG)
-    r = evaluate(lambda _: "wrong", p)
+    r = evaluate(lambda _: "wrong", p, encode=_enc, decode=_dec)
     assert all(s == 0 for s, _ in r["acc_by_length"].values())
 
 
@@ -84,3 +92,16 @@ def test_decide_no_go_when_below_baseline():
     out = decide({"acc_by_length": acc, "prereg_hash": p["_prereg_hash"]},
                  {"baseline_length": 4096}, p)   # 512/4096 = 12.5% < 80%
     assert out["verdict"] == "NoGo"
+
+
+def test_build_tasks_requires_real_tokenizer():
+    p = load_prereg(PREREG)
+    with pytest.raises(ValueError, match='按 token 计'):
+        build_tasks(p, seed=0)
+
+
+def test_evaluate_rejects_unhashed_prereg():
+    p = load_prereg(PREREG)
+    p.pop("_prereg_hash")
+    with pytest.raises(ValueError, match='_prereg_hash'):
+        evaluate(lambda s: "", p, encode=_enc, decode=_dec)

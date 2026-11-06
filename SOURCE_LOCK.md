@@ -314,6 +314,7 @@
 | 语言 mix | 英文 FineWeb-Edu | **英 85% / 中 15%**（C4 + FineWeb-Edu + chinese-fineweb-edu-v2） | 同上 |
 | d_model | 768 | **640**（n_head=10，head_dim=64） | 64k 词表下守住 ~100M（实测 95.06M）；768 会到 ~128M |
 | 参数量 | ~100M | **95.06M 混合骨干 / 93.41M Base-T** | 同上 |
+| 非嵌入参数口径 | `params_non_embed≈75.4M`，10B/75.4M≈132.6 token/param | **non_embed=54.13M**，10B/54.13M≈184.7 token/param | 64k 词表占用 40.96M embedding；在 95M 总量下 non_embed 必然下降。计划书 §3 禁令原意是防止"缩骨干、撑词表"，本次是词表扩大的连带结果。**未重新冻结 token/param 目标**，任何结论须注明该口径 |
 | 数据源 | HuggingFace 流式 | **Kaggle 数据集挂载**（C4 19.3GB + FW-Edu 21GB） | 免下载、版本可 pin、便于算 data_mix_hash |
 
 **连带影响**：baseline_100m_transformer 的旧口径（TinyLlama/768/英文）**全部作废**，必须按新口径重训重冻；

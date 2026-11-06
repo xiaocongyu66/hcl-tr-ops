@@ -59,6 +59,7 @@ class SPARGate(nn.Module):
         logits_corrupt: torch.Tensor,   # [B, T, V] corrupt-prefix view 的 logits
         targets: torch.Tensor,          # [B, T]
         suffix_start: int,              # local suffix 起始位置
+        logits_short: torch.Tensor | None = None,   # [B, L_suffix-1, V] 短上下文前向
         ignore_index: int = -100,
     ) -> dict:
         """按 teacher-forced suffix likelihood 生成门控掩码。
@@ -68,10 +69,22 @@ class SPARGate(nn.Module):
           nll_short:   [B, T] clean 在每个位置上的 NLL
           kl:          [B, T] clean→corrupt 的逐位置 KL 上界（用 -log q_corrupt[target] 近似计数）
         """
-        # short-context likelihood：仅 suffix 区域内计算
-        nll_short = F.cross_entropy(
-            logits_clean.transpose(1, 2), targets, reduction="none", ignore_index=ignore_index
-        )
+        if logits_short is None:
+            raise ValueError(
+                "SPAR 需要真正的短上下文 logits（对 suffix 单独前向）；"
+                "不能用全上下文 NLL 近似")
+        T = targets.shape[1]
+        covered = logits_short.shape[1]
+        if suffix_start + covered > T:
+            raise ValueError(
+                f"短上下文长度 {covered} 超出 suffix 区（T={T}, suffix_start={suffix_start}）")
+        # short-context likelihood：只来自短上下文前向，覆盖 suffix 区
+        nll_short = torch.full((targets.shape[0], T), float("inf"),
+                               device=targets.device, dtype=torch.float32)
+        nll_short[:, suffix_start:suffix_start + covered] = F.cross_entropy(
+            logits_short.transpose(1, 2),
+            targets[:, suffix_start:suffix_start + covered],
+            reduction="none", ignore_index=ignore_index).float()
         # corrupt 视角下的 target 似然（用于 full−short gain 近似）
         nll_corrupt = F.cross_entropy(
             logits_corrupt.transpose(1, 2), targets, reduction="none", ignore_index=ignore_index
@@ -178,17 +191,33 @@ def corrupt_prefix_view(input_ids: torch.Tensor, suffix_len: int = 512,
 
 def spargate_suffix_mask(logits_clean: torch.Tensor, logits_corrupt: torch.Tensor,
                          targets: torch.Tensor, suffix_start: int,
+                         logits_short: torch.Tensor | None = None,
                          nll_threshold: float = 1.0, gain_threshold: float = 0.1,
                          ignore_index: int = -100) -> torch.Tensor:
     """无参数版的 short-context sufficiency gate（mode="suffix_likelihood"）。
 
-    与 SPARGate.suffix_likelihood_gate 同判据，但不需要实例化模块，便于训练循环内联使用。
+    ``logits_short`` 必须来自**只保留 suffix 上下文**的独立前向。用全上下文
+    logits 代替会让 "short-context likelihood" 退化成近似，计划书 §4.8 不允许。
     """
-    nll_c = F.cross_entropy(logits_clean.transpose(1, 2), targets,
-                            reduction="none", ignore_index=ignore_index)
+    if logits_short is None:
+        raise ValueError(
+            "SPAR 需要真正的短上下文 logits（对 suffix 单独前向）；"
+            "不能用全上下文 NLL 近似")
+    T = targets.shape[1]
+    covered = logits_short.shape[1]
+    if suffix_start + covered > T:
+        raise ValueError(
+            f"短上下文长度 {covered} 超出 suffix 区（T={T}, suffix_start={suffix_start}）")
+    nll_short = torch.full((targets.shape[0], T), float("inf"),
+                           device=targets.device, dtype=torch.float32)
+    short_targets = targets[:, suffix_start:suffix_start + covered]
+    nll_short[:, suffix_start:suffix_start + covered] = F.cross_entropy(
+        logits_short.transpose(1, 2), short_targets,
+        reduction="none", ignore_index=ignore_index).float()
     nll_k = F.cross_entropy(logits_corrupt.transpose(1, 2), targets,
                             reduction="none", ignore_index=ignore_index)
-    gain = nll_k - nll_c
-    pos = torch.arange(targets.shape[1], device=targets.device).view(1, -1)
+    gain = nll_k - nll_short
+    pos = torch.arange(T, device=targets.device).view(1, -1)
     return (pos >= suffix_start) & (targets != ignore_index) & \
-           (nll_c < nll_threshold) & (gain.abs() < gain_threshold)
+           torch.isfinite(nll_short) & \
+           (nll_short < nll_threshold) & (gain.abs() < gain_threshold)

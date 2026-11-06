@@ -95,3 +95,23 @@ def test_invalid_solve_mode():
     args = _inputs(tokens=8)
     with pytest.raises(ValueError, match='solve'):
         chunkwise_fused(*args, chunk=4, solve='magic')
+
+
+def test_triton_shape_validation():
+    from hcl_tr.models.gdn2_recur_triton import select_dv_tile, validate_triton_shapes
+
+    assert select_dv_tile(64) == 32
+    assert select_dv_tile(48) == 16      # 48 不能被 32 整除，退到 16
+    assert select_dv_tile(32) == 32
+    with pytest.raises(ValueError, match='不能被任何'):
+        select_dv_tile(24)               # 24 没有 >=16 的 2 的幂因子
+
+    validate_triton_shapes(64, 64, 64, 32)   # 生产配置
+    with pytest.raises(ValueError, match='chunk'):
+        validate_triton_shapes(86, 64, 64, 32)
+    with pytest.raises(ValueError, match='dk'):
+        validate_triton_shapes(64, 48, 64, 32)
+    with pytest.raises(ValueError, match='dv'):
+        validate_triton_shapes(64, 64, 80, 32)
+    with pytest.raises(ValueError, match='dv'):
+        validate_triton_shapes(64, 64, 8, 16)

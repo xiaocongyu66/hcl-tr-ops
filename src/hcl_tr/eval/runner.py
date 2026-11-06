@@ -60,26 +60,60 @@ _FILLER = ("The grass is green. The sky is blue. The sun rises in the east. "
            "Water flows downhill. Birds fly in the sky. Trees grow tall.")
 
 
-def build_tasks(prereg: dict, seed: int = 0,
-                key_kind: str = "word") -> list[Task]:
-    """按预注册的长度网格与位置规则构造 needle-in-a-haystack 任务。"""
+def tokenizer_fns(tok):
+    """把 HF tokenizer / tokenizers.Tokenizer 统一成 encode/decode 两个 callable。"""
+    def encode(text: str) -> list[int]:
+        out = tok.encode(text)
+        return list(out if not hasattr(out, "ids") else out.ids)
+
+    def decode(ids: list[int]) -> str:
+        return tok.decode(ids)
+
+    return encode, decode
+
+
+def build_tasks(prereg: dict, seed: int = 0, key_kind: str = "word",
+                encode=None, decode=None) -> list[Task]:
+    """按预注册的长度网格构造 needle-in-a-haystack 任务。
+
+    长度以 **token** 计：必须传入真实 tokenizer 的 encode/decode。
+    旧实现用词数近似长度，不符合预注册口径，已移除。
+    """
+    if encode is None or decode is None:
+        raise ValueError(
+            "评测长度必须按 token 计：请传入 tokenizer 的 encode/decode"
+            "（可用 tokenizer_fns(tokenizer)）")
     rng = random.Random(seed)
     tasks: list[Task] = []
     samples = int(prereg["samples_per_length"])
+    question = "What is the magic number? Answer:"
+    q_ids = encode(question)
+    filler_ids = encode(_FILLER)
+    if not filler_ids:
+        raise ValueError("filler 编码为空，tokenizer 不可用")
     for L in prereg["lengths"]:
+        long_base = (filler_ids * (L // len(filler_ids) + 4))[: L + 256]
         for i in range(samples):
-            # needle 位置：预注册只写"均匀采样 10 个位置"，按其含义等距取点
             depth = (i % 10) / 10.0
             needle = f"magic-{rng.randrange(10**6):06d}"
-            question = f"What is the magic number? Answer:"
-            # 用词数近似长度（评测口径以 token 计；此处由调用方的 tokenizer 对齐）
-            body_words = max(1, L - 20)
-            filler = (_FILLER + " ") * (body_words // len(_FILLER.split()) + 1)
-            words = filler.split()[:body_words]
-            pos = int(depth * len(words))
-            words = words[:pos] + [f"The secret code is {needle}."] + words[pos:]
-            prompt = " ".join(words) + "\n\n" + question
-            tasks.append(Task(L, needle, question, prompt, needle))
+            needle_text = f"The secret code is {needle}."
+            n_ids = encode(needle_text)
+            n_fill = max(1, L - len(n_ids) - len(q_ids) - 2)
+            text, tok_len = "", -1
+            for _ in range(8):
+                ids = long_base[:max(1, min(n_fill, len(long_base)))]
+                pos = int(depth * len(ids))
+                text = (decode(ids[:pos]) + " " + needle_text + " "
+                        + decode(ids[pos:]) + "\n\n" + question)
+                tok_len = len(encode(text))
+                if abs(tok_len - L) <= 2:
+                    break
+                n_fill = max(1, min(n_fill + (L - tok_len), len(long_base)))
+            if abs(tok_len - L) > 2:
+                raise ValueError(
+                    f"无法构造接近 {L} token 的样本（实际 {tok_len}）："
+                    "检查 tokenizer 的 encode/decode 是否一致")
+            tasks.append(Task(L, needle, question, text, needle))
     return tasks
 
 
@@ -90,9 +124,14 @@ def score(prediction: str, answer: str) -> bool:
 # ---------------- 主流程 ----------------
 
 def evaluate(predict: Callable[[str], str], prereg: dict,
-             seed: int = 0) -> dict:
-    """跑完整评测，返回 {length: (successes, n)} 与预注册元信息。"""
-    tasks = build_tasks(prereg, seed=seed)
+             seed: int = 0, encode=None, decode=None) -> dict:
+    """跑完整评测，返回 {length: (successes, n)} 与预注册元信息。
+
+    必须使用经 load_prereg 加载的预注册（带 _prereg_hash），长度按 token 计。
+    """
+    if "_prereg_hash" not in prereg:
+        raise ValueError("evaluate 需要经 load_prereg 读取的预注册（缺少 _prereg_hash）")
+    tasks = build_tasks(prereg, seed=seed, encode=encode, decode=decode)
     acc: dict[int, list[int]] = {L: [0, 0] for L in prereg["lengths"]}
     for t in tasks:
         pred = predict(t.prompt)

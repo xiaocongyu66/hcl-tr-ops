@@ -122,6 +122,22 @@ def _cuda_count() -> int:
     return torch.cuda.device_count() if torch.cuda.is_available() else 0
 
 
+# 目前只有阶段 0 有实际实现；其余阶段会静默训练同一个骨干，必须拒绝。
+IMPLEMENTED_STAGES = {"0"}
+
+
+def validate_batch_product(tcfg, n_gpu: int) -> None:
+    per_step = (tcfg.micro_batch_per_gpu * tcfg.grad_accum
+                * tcfg.seq_len * n_gpu)
+    if per_step != tcfg.global_batch_tokens:
+        raise SystemExit(
+            f"batch 口径不一致：micro({tcfg.micro_batch_per_gpu}) × "
+            f"accum({tcfg.grad_accum}) × seq({tcfg.seq_len}) × "
+            f"n_gpu({n_gpu}) = {per_step}，"
+            f"但 global_batch_tokens = {tcfg.global_batch_tokens}。"
+            "请修正配置或 --n-gpu，避免实际 batch 与调度口径不符。")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", required=True, help="训练阶段：0/1/1.5/2/3/4/deploy")
@@ -137,6 +153,13 @@ def main() -> int:
 
     run_lock_gate()
     check_stage_allowed(args.stage)
+    if args.stage not in IMPLEMENTED_STAGES:
+        print(
+            f"阶段 {args.stage} 尚无实现：train.py 目前只会训练阶段 0 的混合骨干。"
+            f"已实现阶段: {sorted(IMPLEMENTED_STAGES)}。为避免静默训练错误的目标，拒绝启动。",
+            file=sys.stderr,
+        )
+        return 6
 
     cfg_path = Path(args.config)
     if not cfg_path.exists():
@@ -150,8 +173,21 @@ def main() -> int:
         tcfg = train_config_from_config(cfg, lr=args.lr, out_dir=args.out_dir,
                                         resume_from=args.resume_from,
                                         ckpt_sha256=args.ckpt_sha256)
+        # 参数口径必须可审计：total / non-embed / token per non-embed param。
+        from hcl_tr.models.backbone import HybridBackbone
+        _model = HybridBackbone(**kwargs)
+        total = sum(p.numel() for p in _model.parameters())
+        embed = _model.embed.weight.numel()
+        non_embed = total - embed
+        audit = {
+            "params_total": total,
+            "params_embed": embed,
+            "params_non_embed": non_embed,
+            "tokens_per_non_embed_param": (tcfg.total_tokens / non_embed
+                                           if non_embed else None),
+        }
         print("dry-run: 闸门通过、阶段允许。未开始实际训练。")
-        print(json.dumps({"model": kwargs,
+        print(json.dumps({"model": kwargs, "params": audit,
                           "train": {k: getattr(tcfg, k) for k in (
                               "seq_len", "micro_batch_per_gpu", "grad_accum",
                               "global_batch_tokens", "lr", "total_tokens", "out_dir")}},
@@ -175,13 +211,17 @@ def main() -> int:
                                     resume_from=args.resume_from,
                                     ckpt_sha256=args.ckpt_sha256)
     n_gpu = args.n_gpu or _cuda_count()
+    validate_batch_product(tcfg, n_gpu)
 
     if n_gpu >= 2:
         consumed = train_ddp(kwargs, args.data_dir, tcfg, world_size=n_gpu)
     else:
         from hcl_tr.data.prefetch import ShardStream
+        # 每个 next() 是 micro-batch；训练循环会累积 grad_accum 个。
+        # 传 global_batch_tokens 会把实际 batch 放大 grad_accum 倍。
         stream = ShardStream(args.data_dir, seq_len=tcfg.seq_len,
-                             batch_tokens=tcfg.global_batch_tokens, ddp=False)
+                             batch_tokens=tcfg.micro_batch_per_gpu * tcfg.seq_len,
+                             ddp=False)
         consumed = train(HybridBackbone(**kwargs), stream, tcfg)
     print(f"训练结束：本 rank 消费 {consumed} tokens")
     return 0
