@@ -98,7 +98,7 @@ def test_variant_benchmark_records_all_cpu_variants():
     assert result_row['effective_chunk'] <= 64
     row = result_row['variants']
     assert set(row) == {'reference', 'fused_solve', 'fused_blocked64',
-                        'fused_blocked128', 'fused_widestep'}
+                        'fused_blocked128', 'fused_widestep', 'fused_triton'}
     assert all('median_ms' in row[name] for name in row)
 
 

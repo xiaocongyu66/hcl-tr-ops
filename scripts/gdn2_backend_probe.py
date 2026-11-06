@@ -806,6 +806,9 @@ def benchmark_chunk_variants(*, tokens_list=(2048, 8192), chunk=512, heads=10, d
             "fused_widestep": lambda a, c, ce: chunkwise_fused(
                 *a, chunk=wide_eff, chunk_eff=wide_eff, solve="reference",
                 neg_clamp=80.0),
+            "fused_triton": lambda a, c, ce: chunkwise_fused(
+                *a, chunk=wide_eff, chunk_eff=wide_eff, solve="reference",
+                neg_clamp=80.0, loop_backend="triton"),
         }
         row = {}
         # 正反两轮：若某变体只在"第一个跑"时慢，说明是时钟爬升而不是实现差异。
