@@ -110,3 +110,42 @@ def test_decontamination_requires_eval_texts(tmp_path):
                                   tmp_path / "s2", weights={"a": 1.0},
                                   total_tokens=100, shard_tokens=500,
                                   decontam_ngram=13)
+
+
+def test_overwrite_clears_stale_val_shards(tmp_path):
+    docs = [f"doc {i} " * 30 for i in range(200)]
+    tok = _toy_tokenizer(tmp_path, docs)
+    out = tmp_path / "s"
+    ingest.build_mixed_shards({"a": docs}, {"a": docs[:40]}, str(tok), out,
+                              weights={"a": 1.0}, total_tokens=2000,
+                              shard_tokens=300)
+    first = len(list((out / "val").glob("shard_*.npy")))
+    assert first >= 2
+    ingest.build_mixed_shards({"a": docs}, {"a": docs[:2]}, str(tok), out,
+                              weights={"a": 1.0}, total_tokens=500,
+                              shard_tokens=300, overwrite=True)
+    second = len(list((out / "val").glob("shard_*.npy")))
+    assert second < first, "overwrite 未清理旧验证分片"
+
+
+def test_cli_multi_source_weights(tmp_path, monkeypatch):
+    import sys
+    src_a = tmp_path / "a.jsonl"
+    src_b = tmp_path / "b.jsonl"
+    rows_a = [{"text": f"alpha {i} " * 20} for i in range(100)]
+    rows_b = [{"text": f"beta {i} " * 20} for i in range(100)]
+    src_a.write_text("\n".join(json.dumps(r) for r in rows_a), encoding="utf-8")
+    src_b.write_text("\n".join(json.dumps(r) for r in rows_b), encoding="utf-8")
+    out = tmp_path / "shards"
+    tok_dir = tmp_path / "tok"
+    monkeypatch.setattr(sys, "argv", [
+        "ingest_text.py", "--source", f"a={src_a}", "--source", f"b={src_b}",
+        "--weight", "a=0.9", "--weight", "b=0.1",
+        "--train-tokenizer", str(tok_dir), "--vocab-size", "300",
+        "--out", str(out), "--total-tokens", "2000", "--shard-tokens", "1000",
+        "--no-near-dedup",
+    ])
+    ingest.main()
+    meta = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert meta["tokens"] == 2000
+    assert meta["realized_ratio"]["a"] > 0.8

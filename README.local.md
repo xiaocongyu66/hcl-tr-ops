@@ -35,7 +35,8 @@ python train.py --stage 0 --config src/hcl_tr/configs/stage0_mvp1a.yaml --dry-ru
 ## 开 10B 主训前的硬门槛
 
 `train.py` 启动即跑 `scripts/lock_check.py`；任一缺口即退出。UNVERIFIED 模块所在的训练阶段被硬拦截
-（当前 `--stage deploy` 因 DASC 冻结而拒绝启动，exit 4；`--stage 0/2` 已放行）。
+（当前 `--stage deploy` 因 DASC 冻结而拒绝启动，exit 4）。**目前只有 `--stage 0` 有实际实现**，
+其余阶段直接 exit 6，避免静默训练同一个骨干。
 
 ## 近期验证状态
 

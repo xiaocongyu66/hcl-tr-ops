@@ -240,13 +240,16 @@ def build_mixed_shards(train_by_source: dict[str, list[str]],
     from tokenizers import Tokenizer
 
     out = Path(out_dir)
+    val_dir = out / "val"
     existing = list(out.glob("shard_*.npy"))
-    if existing and not overwrite:
+    existing_val = list(val_dir.glob("shard_*.npy")) if val_dir.exists() else []
+    if (existing or existing_val) and not overwrite:
         raise FileExistsError(
-            f"{out} 已有 {len(existing)} 个分片；为避免旧分片混入新语料，"
-            "请换目录或显式 overwrite=True")
+            f"{out} 已有 {len(existing)} 个训练分片 / {len(existing_val)} 个验证分片；"
+            "为避免旧数据混入新语料，请换目录或显式 overwrite=True")
     if overwrite:
-        for p in existing + list(out.glob("shard_*.ready")):
+        for p in existing + list(out.glob("shard_*.ready")) \
+                + existing_val + list(val_dir.glob("shard_*.ready")):
             p.unlink()
 
     tok = Tokenizer.from_file(tokenizer_path)
@@ -278,7 +281,6 @@ def build_mixed_shards(train_by_source: dict[str, list[str]],
     written, shards = _write_arrays(mixed, out, shard_tokens)
 
     val_tokens = 0
-    val_dir = out / "val"
     for name, docs in val_by_source.items():
         if not docs:
             continue
@@ -306,7 +308,7 @@ def build_mixed_shards(train_by_source: dict[str, list[str]],
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", action="append", required=True)
+    ap.add_argument("--input", action="append")
     ap.add_argument("--field", action="append", default=[])
     ap.add_argument("--out", default="data/shards")
     ap.add_argument("--tokenizer")
@@ -325,25 +327,57 @@ def main() -> None:
                     help=">0 时强制要求 --eval-texts，否则 loud fail")
     ap.add_argument("--edu-min", type=float, default=0.0)
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--source", action="append", default=[], metavar="NAME=PATH",
+                    help="多源混合；可重复。与 --input 二选一")
+    ap.add_argument("--weight", action="append", default=[], metavar="NAME=W",
+                    help="配合 --source 的权重；未指定则均分")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--manifest", default=None)
     args = ap.parse_args()
 
-    docs = load_documents(args.input, tuple(args.field))
-    if args.limit:
-        docs = docs[:args.limit]
-    docs = preprocess_docs(docs, min_chars=args.min_chars, max_chars=args.max_chars,
-                           near_dedup=not args.no_near_dedup, seed=args.seed)
-    if args.edu_min > 0:
-        docs = edu_filter(docs, min_score=args.edu_min)
-        print(f"教育分过滤后保留 {len(docs)} 条")
-    train_docs, val_docs = split_holdout(docs, args.holdout_frac, args.seed)
-    print(f"训练/验证划分: {len(train_docs)} / {len(val_docs)}")
+    if args.source:
+        sources: dict[str, str] = {}
+        for item in args.source:
+            name, _, path = item.partition("=")
+            if not name or not path:
+                raise SystemExit(f"--source 需要 NAME=PATH，得到 {item!r}")
+            sources[name] = path
+        weights = {name: 1.0 for name in sources}
+        for item in args.weight:
+            name, _, w = item.partition("=")
+            if name not in sources:
+                raise SystemExit(f"--weight 指定的源不存在: {name}")
+            weights[name] = float(w)
+        docs_by_source = {name: load_documents([path], tuple(args.field))
+                          for name, path in sources.items()}
+        input_paths = list(sources.values())
+    else:
+        if not args.input:
+            raise SystemExit("需要 --input 或 --source")
+        docs_by_source = {"main": load_documents(args.input, tuple(args.field))}
+        weights = {"main": 1.0}
+        input_paths = list(args.input)
 
+    train_by_source: dict[str, list[str]] = {}
+    val_by_source: dict[str, list[str]] = {}
+    for name, docs in docs_by_source.items():
+        if args.limit:
+            docs = docs[:args.limit]
+        docs = preprocess_docs(docs, min_chars=args.min_chars, max_chars=args.max_chars,
+                               near_dedup=not args.no_near_dedup, seed=args.seed)
+        if args.edu_min > 0:
+            docs = edu_filter(docs, min_score=args.edu_min)
+            print(f"教育分过滤后 {name} 保留 {len(docs)} 条")
+        tr, va = split_holdout(docs, args.holdout_frac, args.seed)
+        train_by_source[name], val_by_source[name] = tr, va
+        print(f"{name}: 训练/验证划分 {len(tr)} / {len(va)}")
+
+    all_train = shuffle_docs([d for ds in train_by_source.values() for d in ds],
+                             args.seed)
     tokenizer_path = args.tokenizer
     if args.train_tokenizer:
         from hcl_tr.data.tokenizer import tokenizer_meta, train_bpe
-        path = train_bpe(train_docs, args.train_tokenizer, vocab_size=args.vocab_size)
+        path = train_bpe(all_train, args.train_tokenizer, vocab_size=args.vocab_size)
         tokenizer_path = str(path)
         print("词表:", tokenizer_meta(path, args.vocab_size))
     if not tokenizer_path:
@@ -356,12 +390,12 @@ def main() -> None:
                       if ln.strip()]
 
     result = build_mixed_shards(
-        {"main": train_docs}, {"main": val_docs}, tokenizer_path, args.out,
-        weights={"main": 1.0}, total_tokens=args.total_tokens,
+        train_by_source, val_by_source, tokenizer_path, args.out,
+        weights=weights, total_tokens=args.total_tokens,
         shard_tokens=args.shard_tokens, eval_texts=eval_texts,
         decontam_ngram=args.decontam_ngram, seed=args.seed,
         overwrite=args.overwrite)
-    result.update(inputs=list(args.input), input_sha256=_sha256(args.input),
+    result.update(inputs=input_paths, input_sha256=_sha256(input_paths),
                   tokenizer=tokenizer_path)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if args.manifest:
